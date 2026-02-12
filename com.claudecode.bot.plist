@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service Identifier -->
+    <key>Label</key>
+    <string>com.claudecode.bot</string>
+
+    <!-- Path to the executable script -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/nathanmadrid/claude-code-always-on/scripts/start-bot.sh</string>
+    </array>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/nathanmadrid/claude-code-always-on</string>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+
+    <!-- Run at load/login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep alive - restart if it crashes -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart if it exits with an error -->
+        <key>SuccessfulExit</key>
+        <false/>
+        <!-- Restart if it crashes -->
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Restart after 5 seconds if it crashes -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Proactive check-in: expect a heartbeat every 30 minutes -->
+    <key>ExitTimeOut</key>
+    <integer>1800</integer>
+
+    <!-- Standard output and error logging -->
+    <key>StandardOutPath</key>
+    <string>/Users/nathanmadrid/claude-code-always-on/logs/bot-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/nathanmadrid/claude-code-always-on/logs/bot-stderr.log</string>
+
+    <!-- Log rotation: keep logs from growing too large -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>1024</integer>
+    </dict>
+
+    <!-- Run in the background, independent of any terminal session -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <!-- Process type: adaptive for better resource management -->
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+
+    <!-- Nice value: lower priority (0-20, higher = lower priority) -->
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- Add to Mac's login items for auto-start on boot/login -->
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+        <string>LoginWindow</string>
+        <string>StandardIO</string>
+    </array>
+
+    <!-- Ensure it runs even when no user is logged in (requires root) -->
+    <!-- Remove this section if you only want it to run when you're logged in -->
+    <!-- <key>UserName</key> -->
+    <!-- <string>nathanmadrid</string> -->
+</dict>
+</plist>
