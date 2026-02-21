@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-# Ensure PATH includes Homebrew (launchd has a minimal PATH)
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Ensure PATH includes Homebrew and local bin (launchd has a minimal PATH)
+export PATH="/Users/nathanmadrid/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # Script configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
