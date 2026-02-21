@@ -64,7 +64,7 @@ ANTHROPIC_API_KEY=         # For Claude Code
 
 # Supabase (for memory features)
 SUPABASE_URL=
-SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_KEY=
 
 # Optional (voice features)
 ELEVENLABS_API_KEY=
@@ -194,18 +194,21 @@ if (/^(what did|show me).*(yesterday|last week)/i.test(message)) {
 All database operations use typed clients in `src/database/`:
 
 ```typescript
-import { dbClient } from "./database/client.js";
-import { messagesDb } from "./database/messages.js";
-import { goalsDb } from "./database/goals.js";
+import { getDatabaseClient } from "./database/client.js";
+import { storeMessage, searchSimilarMessages } from "./database/messages.js";
+import { getActiveGoals } from "./database/goals.js";
 
-// Store message with embedding
-await messagesDb.storeMessage(userId, content, messageId);
+const client = getDatabaseClient().supabase;
 
-// Semantic search
-const similar = await messagesDb.searchMessages(userId, "query about...", 5);
+// Store message (role is "user" | "assistant" | "system")
+await storeMessage(client, userId, "user", content);
+
+// Semantic search (requires a pre-computed embedding vector, not a string)
+const embedding = await generateEmbedding(text); // number[]
+const similar = await searchSimilarMessages(client, embedding, userId, 5);
 
 // Goal tracking
-const active = await goalsDb.getActiveGoals(userId);
+const active = await getActiveGoals(client, userId);
 ```
 
 ### Claude Code Invocation Patterns
@@ -286,7 +289,7 @@ launchctl kickstart -k gui/501/com.claudecode.bot
 - Check if `ANTHROPIC_API_KEY` is set correctly
 
 **Database connection errors:**
-- Verify `SUPABASE_URL` and `SUPABASE_ANON_KEY`
+- Verify `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
 - Check Supabase project is not paused (free tier auto-pauses)
 - Ensure pgvector extension is enabled
 
