@@ -1,147 +1,93 @@
--- Enable pgvector extension for vector similarity search
+-- ============================================================================
+-- Claude Code Always-On: Database Schema
+-- Run this in the Supabase SQL Editor
+-- ============================================================================
+
+-- Enable pgvector extension
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ============================================================================
 -- MESSAGES TABLE
--- Stores conversation history with semantic embeddings
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   telegram_user_id BIGINT NOT NULL,
   telegram_message_id BIGINT,
-
-  -- Message content
   role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
   content TEXT NOT NULL,
-
-  -- Metadata
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
-
-  -- Semantic embedding for search (text-embedding-3-large = 3072 dimensions)
   embedding vector(3072),
-
-  -- Optional metadata JSON
-  metadata JSONB DEFAULT '{}'::jsonb,
-
-  -- Indexes
-  INDEX idx_messages_user_created (telegram_user_id, created_at DESC),
-  INDEX idx_messages_role (role)
+  metadata JSONB DEFAULT '{}'::jsonb
 );
 
--- Create HNSW index for fast vector similarity search
-CREATE INDEX idx_messages_embedding ON messages
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_messages_user_created ON messages(telegram_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
 
 -- ============================================================================
 -- GOALS TABLE
--- Stores user goals with semantic search capabilities
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS goals (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   telegram_user_id BIGINT NOT NULL,
-
-  -- Goal content
   title TEXT NOT NULL,
   description TEXT,
   status TEXT DEFAULT 'active' CHECK (status IN ('active', 'completed', 'archived')),
-
-  -- Timestamps
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   completed_at TIMESTAMPTZ,
-
-  -- Priority and categorization
   priority INTEGER DEFAULT 5 CHECK (priority BETWEEN 1 AND 10),
   category TEXT,
-
-  -- Semantic embedding
   embedding vector(3072),
-
-  -- Metadata
-  metadata JSONB DEFAULT '{}'::jsonb,
-
-  -- Indexes
-  INDEX idx_goals_user_status (telegram_user_id, status),
-  INDEX idx_goals_priority (priority DESC)
+  metadata JSONB DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX idx_goals_embedding ON goals
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_goals_user_status ON goals(telegram_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_goals_priority ON goals(priority DESC);
 
 -- ============================================================================
 -- USER_FACTS TABLE
--- Stores facts about users for personalization
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS user_facts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   telegram_user_id BIGINT NOT NULL,
-
-  -- Fact content
-  fact_type TEXT NOT NULL, -- e.g., 'preference', 'context', 'relationship', 'habit'
+  fact_type TEXT NOT NULL,
   fact_text TEXT NOT NULL,
   confidence INTEGER DEFAULT 5 CHECK (confidence BETWEEN 1 AND 10),
-
-  -- Source tracking
-  source TEXT, -- Where this fact came from (user_message, inference, etc.)
+  source TEXT,
   source_message_id UUID REFERENCES messages(id) ON DELETE SET NULL,
-
-  -- Timestamps
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   last_accessed_at TIMESTAMPTZ DEFAULT NOW(),
-
-  -- Access tracking for relevance
   access_count INTEGER DEFAULT 0,
-
-  -- Semantic embedding
   embedding vector(3072),
-
-  -- Indexes
-  UNIQUE (telegram_user_id, fact_type, fact_text),
-  INDEX idx_facts_user_type (telegram_user_id, fact_type),
-  INDEX idx_facts_confidence (confidence DESC)
+  UNIQUE (telegram_user_id, fact_type, fact_text)
 );
 
-CREATE INDEX idx_user_facts_embedding ON user_facts
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_facts_user_type ON user_facts(telegram_user_id, fact_type);
+CREATE INDEX IF NOT EXISTS idx_facts_confidence ON user_facts(confidence DESC);
 
 -- ============================================================================
 -- CONVERSATION_CONTEXTS TABLE
--- Tracks conversation sessions for context management
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS conversation_contexts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   telegram_user_id BIGINT NOT NULL,
-
-  -- Session info
   session_id TEXT NOT NULL,
   started_at TIMESTAMPTZ DEFAULT NOW(),
   ended_at TIMESTAMPTZ,
-
-  -- Context summary (generated by AI)
   summary TEXT,
   summary_embedding vector(3072),
-
-  -- Message count
   message_count INTEGER DEFAULT 0,
-
-  -- Metadata
   metadata JSONB DEFAULT '{}'::jsonb,
-
-  -- Indexes
-  UNIQUE (telegram_user_id, session_id),
-  INDEX idx_contexts_user_time (telegram_user_id, started_at DESC)
+  UNIQUE (telegram_user_id, session_id)
 );
 
--- ============================================================================
--- FUNCTIONS AND TRIGGERS
--- ============================================================================
+CREATE INDEX IF NOT EXISTS idx_contexts_user_time ON conversation_contexts(telegram_user_id, started_at DESC);
 
--- Update updated_at timestamp automatically
+-- ============================================================================
+-- TRIGGERS
+-- ============================================================================
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -150,27 +96,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Apply the trigger to relevant tables
+DROP TRIGGER IF EXISTS update_messages_updated_at ON messages;
 CREATE TRIGGER update_messages_updated_at
 BEFORE UPDATE ON messages
-FOR EACH ROW
-EXECUTE FUNCTION update_updated_at();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
+DROP TRIGGER IF EXISTS update_goals_updated_at ON goals;
 CREATE TRIGGER update_goals_updated_at
 BEFORE UPDATE ON goals
-FOR EACH ROW
-EXECUTE FUNCTION update_updated_at();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
+DROP TRIGGER IF EXISTS update_user_facts_updated_at ON user_facts;
 CREATE TRIGGER update_user_facts_updated_at
 BEFORE UPDATE ON user_facts
-FOR EACH ROW
-EXECUTE FUNCTION update_updated_at();
+FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- ============================================================================
--- VECTOR SIMILARITY SEARCH FUNCTION
+-- SEMANTIC SEARCH FUNCTIONS
 -- ============================================================================
-
--- Function to search similar messages
 CREATE OR REPLACE FUNCTION search_similar_messages(
   query_embedding vector(3072),
   target_user_id BIGINT DEFAULT NULL,
@@ -186,15 +129,10 @@ RETURNS TABLE (
 ) AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    m.id,
-    m.telegram_user_id,
-    m.role,
-    m.content,
+  SELECT m.id, m.telegram_user_id, m.role, m.content,
     1 - (m.embedding <=> query_embedding) AS similarity
   FROM messages m
-  WHERE
-    m.embedding IS NOT NULL
+  WHERE m.embedding IS NOT NULL
     AND (target_user_id IS NULL OR m.telegram_user_id = target_user_id)
     AND (1 - (m.embedding <=> query_embedding)) >= similarity_threshold
   ORDER BY m.embedding <=> query_embedding
@@ -202,7 +140,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Function to search relevant goals
 CREATE OR REPLACE FUNCTION search_relevant_goals(
   query_embedding vector(3072),
   target_user_id BIGINT,
@@ -210,32 +147,21 @@ CREATE OR REPLACE FUNCTION search_relevant_goals(
   similarity_threshold REAL DEFAULT 0.6
 )
 RETURNS TABLE (
-  id UUID,
-  title TEXT,
-  description TEXT,
-  status TEXT,
-  similarity REAL
+  id UUID, title TEXT, description TEXT, status TEXT, similarity REAL
 ) AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    g.id,
-    g.title,
-    g.description,
-    g.status,
+  SELECT g.id, g.title, g.description, g.status,
     1 - (g.embedding <=> query_embedding) AS similarity
   FROM goals g
-  WHERE
-    g.telegram_user_id = target_user_id
-    AND g.embedding IS NOT NULL
-    AND g.status = 'active'
+  WHERE g.telegram_user_id = target_user_id
+    AND g.embedding IS NOT NULL AND g.status = 'active'
     AND (1 - (g.embedding <=> query_embedding)) >= similarity_threshold
   ORDER BY g.embedding <=> query_embedding
   LIMIT limit_count;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Function to search relevant user facts
 CREATE OR REPLACE FUNCTION search_relevant_facts(
   query_embedding vector(3072),
   target_user_id BIGINT,
@@ -243,23 +169,14 @@ CREATE OR REPLACE FUNCTION search_relevant_facts(
   similarity_threshold REAL DEFAULT 0.65
 )
 RETURNS TABLE (
-  id UUID,
-  fact_type TEXT,
-  fact_text TEXT,
-  confidence INTEGER,
-  similarity REAL
+  id UUID, fact_type TEXT, fact_text TEXT, confidence INTEGER, similarity REAL
 ) AS $$
 BEGIN
   RETURN QUERY
-  SELECT
-    f.id,
-    f.fact_type,
-    f.fact_text,
-    f.confidence,
+  SELECT f.id, f.fact_type, f.fact_text, f.confidence,
     1 - (f.embedding <=> query_embedding) AS similarity
   FROM user_facts f
-  WHERE
-    f.telegram_user_id = target_user_id
+  WHERE f.telegram_user_id = target_user_id
     AND f.embedding IS NOT NULL
     AND (1 - (f.embedding <=> query_embedding)) >= similarity_threshold
   ORDER BY f.embedding <=> query_embedding
@@ -268,83 +185,46 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- ============================================================================
--- ROW LEVEL SECURITY (RLS)
+-- ROW LEVEL SECURITY
 -- ============================================================================
-
--- Enable RLS on all tables
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE goals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_facts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversation_contexts ENABLE ROW LEVEL SECURITY;
 
--- Policies for messages (users can only see their own messages)
-CREATE POLICY "Users can view own messages"
-ON messages FOR SELECT
-USING (telegram_user_id = current_setting('app.current_user_id', true)::BIGINT);
-
-CREATE POLICY "Users can insert own messages"
-ON messages FOR INSERT
-WITH CHECK (telegram_user_id = current_setting('app.current_user_id', true)::BIGINT);
-
-CREATE POLICY "Users can update own messages"
-ON messages FOR UPDATE
-USING (telegram_user_id = current_setting('app.current_user_id', true)::BIGINT);
-
--- Policies for goals
-CREATE POLICY "Users can manage own goals"
-ON goals FOR ALL
-USING (telegram_user_id = current_setting('app.current_user_id', true)::BIGINT);
-
--- Policies for user_facts
-CREATE POLICY "Users can manage own facts"
-ON user_facts FOR ALL
-USING (telegram_user_id = current_setting('app.current_user_id', true)::BIGINT);
-
--- Policies for conversation_contexts
-CREATE POLICY "Users can manage own contexts"
-ON conversation_contexts FOR ALL
-USING (telegram_user_id = current_setting('app.current_user_id', true)::BIGINT);
+-- Service role bypass policies (bot uses service_role key)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Service role full access messages') THEN
+    CREATE POLICY "Service role full access messages" ON messages FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Service role full access goals') THEN
+    CREATE POLICY "Service role full access goals" ON goals FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Service role full access facts') THEN
+    CREATE POLICY "Service role full access facts" ON user_facts FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Service role full access contexts') THEN
+    CREATE POLICY "Service role full access contexts" ON conversation_contexts FOR ALL USING (true) WITH CHECK (true);
+  END IF;
+END $$;
 
 -- ============================================================================
--- VIEWS FOR COMMON QUERIES
+-- VIEWS
 -- ============================================================================
-
--- Recent messages view with context
 CREATE OR REPLACE VIEW recent_messages AS
-SELECT
-  m.id,
-  m.telegram_user_id,
-  m.role,
-  m.content,
-  m.created_at,
-  m.metadata
-FROM messages m
-ORDER BY m.created_at DESC;
+SELECT m.id, m.telegram_user_id, m.role, m.content, m.created_at, m.metadata
+FROM messages m ORDER BY m.created_at DESC;
 
--- Active goals view
 CREATE OR REPLACE VIEW active_goals AS
-SELECT
-  g.id,
-  g.telegram_user_id,
-  g.title,
-  g.description,
-  g.priority,
-  g.category,
-  g.created_at
-FROM goals g
-WHERE g.status = 'active'
-ORDER BY g.priority DESC, g.created_at ASC;
+SELECT g.id, g.telegram_user_id, g.title, g.description, g.priority, g.category, g.created_at
+FROM goals g WHERE g.status = 'active' ORDER BY g.priority DESC, g.created_at ASC;
 
 -- ============================================================================
--- GRANTS (adjust based on your Supabase setup)
+-- GRANTS
 -- ============================================================================
-
--- Grant usage to authenticated users
 GRANT USAGE ON SCHEMA public TO authenticated;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO authenticated;
-GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
-
--- Grant execute on functions
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 GRANT EXECUTE ON FUNCTION search_similar_messages TO authenticated;
 GRANT EXECUTE ON FUNCTION search_relevant_goals TO authenticated;
 GRANT EXECUTE ON FUNCTION search_relevant_facts TO authenticated;

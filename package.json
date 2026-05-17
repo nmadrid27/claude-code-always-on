@@ -21,7 +21,7 @@
     "ai-assistant",
     "voice"
   ],
-  "author": "",
+  "author": "Nathan Madrid",
   "license": "MIT",
   "module": "src/index.ts",
   "private": true,

@@ -146,8 +146,8 @@ CLAUDE_TIMEOUT=300000
 
 # OPTIONAL (for memory features)
 SUPABASE_URL=your_supabase_url_here
-SUPABASE_SERVICE_KEY=your_supabase_service_key_here
-OPENAI_API_KEY=your_openai_api_key_here
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_key_here
+VOYAGE_API_KEY=your_voyage_api_key_here
 
 # OPTIONAL (for monitoring)
 LOG_LEVEL=info
@@ -813,7 +813,7 @@ Supabase provides all four. It is PostgreSQL with the `pgvector` extension pre-i
 1. Go to [supabase.com](https://supabase.com) and create a free project.
 2. From your project's Settings > API, copy:
    - **Project URL** (goes in `SUPABASE_URL`)
-   - **Service Role Key** (goes in `SUPABASE_SERVICE_KEY`)
+   - **Service Role Key** (goes in `SUPABASE_SERVICE_ROLE_KEY`)
 3. The anon key is also available but the service role key bypasses Row Level Security, which is what we need for server-side operations.
 
 ### Database Schema Design
@@ -2122,9 +2122,9 @@ src/index.ts
 | `WEBHOOK_SECRET` | No | -- | Telegram webhook verification |
 | `WEBHOOK_PORT` | No | 3000 | HTTP server port |
 | `SUPABASE_URL` | For memory | -- | Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | For memory | -- | Supabase service role key |
+| `SUPABASE_SERVICE_ROLE_KEY` | For memory | -- | Supabase service role key |
 | `SUPABASE_ANON_KEY` | For memory | -- | Supabase anonymous key |
-| `OPENAI_API_KEY` | For embeddings | -- | OpenAI API key |
+| `VOYAGE_API_KEY` | For embeddings | -- | Voyage AI API key |
 | `LOG_LEVEL` | No | info | debug, info, warn, error |
 | `RATE_LIMIT_MAX_REQUESTS` | No | 10 | Max requests per window |
 | `RATE_LIMIT_WINDOW_MS` | No | 60000 | Rate limit window (ms) |

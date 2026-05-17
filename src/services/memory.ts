@@ -444,13 +444,13 @@ export class MemoryService {
  */
 export function createMemoryService(userId: number): MemoryService {
   const url = process.env.SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_KEY;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!url) {
     throw new Error("SUPABASE_URL is required");
   }
   if (!serviceKey) {
-    throw new Error("SUPABASE_SERVICE_KEY is required");
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required");
   }
 
   return new MemoryService({ url, serviceKey }, userId);

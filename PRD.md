@@ -762,7 +762,7 @@ claude -p "List all TypeScript files in src/" \
 | Upsert user fact | INSERT/UPDATE | `user_facts` |
 | Search relevant facts | RPC | `search_relevant_facts()` |
 
-**Authentication:** `SUPABASE_SERVICE_KEY` (bypasses RLS for server-side operations)
+**Authentication:** `SUPABASE_SERVICE_ROLE_KEY` (bypasses RLS for server-side operations)
 
 ---
 
@@ -832,7 +832,7 @@ claude -p "List all TypeScript files in src/" \
 | Variable | Type | Required For | Description |
 |----------|------|-------------|-------------|
 | `SUPABASE_URL` | URL | Semantic memory | Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | String | Semantic memory | Service role key (bypasses RLS) |
+| `SUPABASE_SERVICE_ROLE_KEY` | String | Semantic memory | Service role key (bypasses RLS) |
 | `SUPABASE_ANON_KEY` | String | Client-side operations | Anonymous key |
 | `OPENAI_API_KEY` | String | Embeddings | OpenAI API key for text-embedding-3-large |
 
@@ -1072,7 +1072,7 @@ CREATE POLICY "Service role full access {table}" ON {table}
   FOR ALL USING (true) WITH CHECK (true);
 ```
 
-**Note:** The bot connects with `SUPABASE_SERVICE_KEY` (service role), which bypasses RLS. Future multi-tenant deployments should implement per-user RLS policies using Supabase auth.
+**Note:** The bot connects with `SUPABASE_SERVICE_ROLE_KEY` (service role), which bypasses RLS. Future multi-tenant deployments should implement per-user RLS policies using Supabase auth.
 
 ### 11.6 Views
 

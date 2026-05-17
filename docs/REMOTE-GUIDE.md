@@ -77,16 +77,16 @@ home
 
 ### Prerequisites
 
-These components should already be running if you followed the main README:
-
 - The always-on bot is running (`launchctl list | grep claudecode`)
-- `~/.claude/scripts/` is on your PATH (added to `~/.zshrc`)
 - Obsidian with Local REST API plugin (for vault features, optional)
 
-### Verify the scripts are in place
+### Companion terminal scripts (bring your own)
+
+> **Not bundled.** The terminal helpers (`away`, `home`, `notify`, `claude-telegram`, `telegram-notify.sh`) live in `~/.claude/scripts/` on the author's machine and are *not* shipped with this repository. This guide documents the behavior they provide so you can write your own, or skip them entirely — the bot works fine without them. Only the MCP server (`src/mcp/telegram-approver.ts`) is part of this repo and is invoked directly via the `mcp-config.json` that `install-service.sh` generates.
+
+If you decide to write your own helpers, put them on your `PATH` (typically `~/.claude/scripts/` added in `~/.zshrc`) and verify with:
 
 ```bash
-# Check all scripts exist and are executable
 ls -la ~/.claude/scripts/telegram-notify.sh
 ls -la ~/.claude/scripts/notify
 ls -la ~/.claude/scripts/away

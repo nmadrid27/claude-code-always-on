@@ -322,7 +322,7 @@ export function validateEnvironment(): {
 
   const optional = [
     "SUPABASE_URL",
-    "SUPABASE_SERVICE_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
     "VOYAGE_API_KEY",
     "ELEVENLABS_API_KEY",
     "TWILIO_ACCOUNT_SID",

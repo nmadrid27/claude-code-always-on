@@ -64,7 +64,7 @@ ANTHROPIC_API_KEY=         # For Claude Code
 
 # Supabase (for memory features)
 SUPABASE_URL=
-SUPABASE_SERVICE_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
 
 # Optional (voice features)
 ELEVENLABS_API_KEY=
@@ -72,7 +72,7 @@ ELEVENLABS_AGENT_ID=
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
 TWILIO_PHONE_NUMBER=
-OPENAI_API_KEY=            # For embeddings
+VOYAGE_API_KEY=            # For embeddings
 GEMINI_API_KEY=            # For transcription
 
 # Bot mode
@@ -340,7 +340,7 @@ launchctl kickstart -k gui/501/com.claudecode.bot
 - Check if `ANTHROPIC_API_KEY` is set correctly
 
 **Database connection errors:**
-- Verify `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
+- Verify `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
 - Check Supabase project is not paused (free tier auto-pauses)
 - Ensure pgvector extension is enabled
 
