@@ -7,7 +7,7 @@ import { basename, resolve } from "path";
 import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, writeSync, closeSync, constants } from "fs";
 import { requireAuth } from "./middleware/auth.js";
 import { parseMessage, MessageType } from "./middleware/parser.js";
-import { invokeClaudeCode } from "./relay.js";
+import { invokeClaudeCodeWithRetry } from "./relay.js";
 import { getGoalService } from "./services/goals.js";
 import { createLogger } from "./services/logger.js";
 import {
@@ -619,13 +619,27 @@ bot.on("message:text", async (ctx) => {
     }
 
     // Invoke Claude Code relay with rich context
-    const response = await invokeClaudeCode({
-      prompt,
-      allowedTools: bashReady ? ["bash", "read", "write"] : ["read"],
-      timeout: 120000,
-      maxOutputLength: 3500,
-      workingDirectory: process.cwd(),
-    });
+    const response = await invokeClaudeCodeWithRetry(
+      {
+        prompt,
+        allowedTools: bashReady ? ["bash", "read", "write"] : ["read"],
+        maxOutputLength: 3500,
+        workingDirectory: process.cwd(),
+      },
+      {
+        onTimeoutRetry: async () => {
+          try {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              thinkingMsg.message_id,
+              "⏳ Taking longer than usual; still working on it...",
+            );
+          } catch {
+            // ignore edit failures (e.g. message already deleted)
+          }
+        },
+      },
+    );
 
     // Delete the thinking message
     await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
@@ -714,13 +728,27 @@ bot.on("message:photo", async (ctx) => {
 
     const prompt = `${captionContext}The image has been saved to tmp/${basename(localPath)}. Please analyze the image and describe what you see. If the user provided a caption, use it as context for your analysis.`;
 
-    const response = await invokeClaudeCode({
-      prompt,
-      allowedTools: ["read"],
-      timeout: 120000,
-      maxOutputLength: 3500,
-      workingDirectory: process.cwd(),
-    });
+    const response = await invokeClaudeCodeWithRetry(
+      {
+        prompt,
+        allowedTools: ["read"],
+        maxOutputLength: 3500,
+        workingDirectory: process.cwd(),
+      },
+      {
+        onTimeoutRetry: async () => {
+          try {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              thinkingMsg.message_id,
+              "⏳ Taking longer than usual; still working on it...",
+            );
+          } catch {
+            // ignore edit failures (e.g. message already deleted)
+          }
+        },
+      },
+    );
 
     await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
 
@@ -813,13 +841,27 @@ bot.on("message:document", async (ctx) => {
       prompt = `The user sent a binary document named "${fileName}" (${parsed.metadata?.mimeType || "unknown type"}, ${parsed.metadata?.fileSize ? formatBytes(parsed.metadata.fileSize) : "unknown size"}).${captionContext} The file has been saved to tmp/${basename(localPath)}. Since this is a binary file, please acknowledge receipt and describe what kind of file this is based on the name and MIME type. If it's a PDF, try reading it with available tools.`;
     }
 
-    const response = await invokeClaudeCode({
-      prompt,
-      allowedTools: ["read"],
-      timeout: 120000,
-      maxOutputLength: 3500,
-      workingDirectory: process.cwd(),
-    });
+    const response = await invokeClaudeCodeWithRetry(
+      {
+        prompt,
+        allowedTools: ["read"],
+        maxOutputLength: 3500,
+        workingDirectory: process.cwd(),
+      },
+      {
+        onTimeoutRetry: async () => {
+          try {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              thinkingMsg.message_id,
+              "⏳ Taking longer than usual; still working on it...",
+            );
+          } catch {
+            // ignore edit failures (e.g. message already deleted)
+          }
+        },
+      },
+    );
 
     await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
 
@@ -866,13 +908,27 @@ bot.on("message:video", async (ctx) => {
 
     const prompt = `The user sent a video file.${captionContext}\n\nVideo details:\n- Duration: ${duration} seconds\n- Resolution: ${dimensions}\n- Size: ${fileSize}\n- MIME type: ${parsed.metadata?.mimeType || "video/mp4"}\n- Saved to: tmp/${basename(localPath)}\n\nPlease acknowledge the video, describe what you can determine from the metadata, and let the user know the file has been saved. If the user provided a caption, respond to it in context.`;
 
-    const response = await invokeClaudeCode({
-      prompt,
-      allowedTools: ["read"],
-      timeout: 120000,
-      maxOutputLength: 3500,
-      workingDirectory: process.cwd(),
-    });
+    const response = await invokeClaudeCodeWithRetry(
+      {
+        prompt,
+        allowedTools: ["read"],
+        maxOutputLength: 3500,
+        workingDirectory: process.cwd(),
+      },
+      {
+        onTimeoutRetry: async () => {
+          try {
+            await ctx.api.editMessageText(
+              ctx.chat!.id,
+              thinkingMsg.message_id,
+              "⏳ Taking longer than usual; still working on it...",
+            );
+          } catch {
+            // ignore edit failures (e.g. message already deleted)
+          }
+        },
+      },
+    );
 
     await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
 

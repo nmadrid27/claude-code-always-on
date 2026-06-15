@@ -145,6 +145,9 @@ export interface ClaudeCodeResponse {
   /** Error message if invocation failed */
   error?: string;
 
+  /** True when the failure was specifically a timeout (used to drive retries) */
+  timedOut?: boolean;
+
   /** Tool calls made during execution (if available) */
   toolCalls?: ToolCall[];
 
@@ -200,6 +203,31 @@ export function resolveModel(requestModel?: string): string {
     return fromEnv.trim();
   }
   return DEFAULT_MODEL;
+}
+
+/**
+ * Resolves the invocation timeout (ms), in priority order:
+ *   1. An explicit per-request timeout.
+ *   2. The CLAUDE_TIMEOUT environment variable.
+ *   3. DEFAULT_TIMEOUT_MS (300000 = 5 minutes).
+ * Blank, non-numeric, or non-positive values are ignored.
+ *
+ * Note: the bot's real successful invocations run a median of ~23s with a tail
+ * to ~107s, so the old hardcoded 120s ceiling clipped legitimate calls. 300s
+ * gives ~3x headroom over the worst observed success.
+ */
+export function resolveTimeout(requestTimeout?: number): number {
+  if (typeof requestTimeout === "number" && Number.isFinite(requestTimeout) && requestTimeout > 0) {
+    return requestTimeout;
+  }
+  const fromEnv = process.env.CLAUDE_TIMEOUT;
+  if (fromEnv && fromEnv.trim().length > 0) {
+    const parsed = Number.parseInt(fromEnv.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_TIMEOUT_MS;
 }
 
 /**
@@ -345,8 +373,9 @@ export async function invokeClaudeCode(
   streamCallback?: StreamCallback
 ): Promise<ClaudeCodeResponse> {
   const startTime = Date.now();
-  const timeout = request.timeout ?? DEFAULT_TIMEOUT_MS;
+  const timeout = resolveTimeout(request.timeout);
   const maxOutputLength = request.maxOutputLength ?? DEFAULT_MAX_OUTPUT_LENGTH;
+  let didTimeout = false;
 
   logDebug(`Invoking Claude Code with prompt: "${request.prompt.substring(0, 50)}..."`);
 
@@ -391,6 +420,7 @@ export async function invokeClaudeCode(
     // Set up timeout handler
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => {
+        didTimeout = true;
         logError(`Claude Code invocation timed out after ${timeout}ms`);
         if (proc) {
           proc.kill();
@@ -546,6 +576,7 @@ export async function invokeClaudeCode(
     return {
       success: false,
       error: errorMessage,
+      timedOut: didTimeout,
       metadata: {
         duration,
         truncated: false,
@@ -553,6 +584,57 @@ export async function invokeClaudeCode(
       }
     };
   }
+}
+
+/**
+ * ============================================================================
+ * RETRY WRAPPER
+ * ============================================================================
+ */
+
+/** Options controlling automatic retry behavior on timeout */
+export interface RetryOptions {
+  /** How many extra attempts to make after a timeout (default: 1) */
+  maxTimeoutRetries?: number;
+  /** Invoked before each retry attempt (1-indexed); e.g. to notify the user */
+  onTimeoutRetry?: (attempt: number) => void | Promise<void>;
+}
+
+/**
+ * Invokes Claude Code, retrying ONLY when the failure was a timeout.
+ *
+ * Rationale (evidence-based): a request that times out at the ceiling routinely
+ * succeeds on a warm retry (observed: a request that hit the 120s wall completed
+ * in 44s when re-run seconds later). Non-timeout failures are returned as-is so
+ * we never paper over real errors.
+ *
+ * The `invoker` parameter is injectable purely for testing; production callers
+ * should omit it so the real `invokeClaudeCode` is used.
+ */
+export async function invokeClaudeCodeWithRetry(
+  request: ClaudeCodeRequest,
+  opts: RetryOptions = {},
+  invoker: (
+    req: ClaudeCodeRequest,
+    cb?: StreamCallback
+  ) => Promise<ClaudeCodeResponse> = invokeClaudeCode,
+  streamCallback?: StreamCallback
+): Promise<ClaudeCodeResponse> {
+  const maxRetries = opts.maxTimeoutRetries ?? 1;
+
+  let response = await invoker(request, streamCallback);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Stop as soon as we succeed or hit a non-timeout failure.
+    if (response.success || !response.timedOut) {
+      return response;
+    }
+    if (opts.onTimeoutRetry) {
+      await opts.onTimeoutRetry(attempt);
+    }
+    logError(`Claude Code timed out; retry attempt ${attempt}/${maxRetries}`);
+    response = await invoker(request, streamCallback);
+  }
+  return response;
 }
 
 /**
