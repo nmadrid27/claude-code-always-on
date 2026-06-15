@@ -14,7 +14,7 @@
 
 import { getSupabaseClient } from "../database/supabase.js";
 import { upsertUserFact, getUserFacts, deleteFact } from "../database/user-facts.js";
-import { createGoal } from "../database/goals.js";
+import { createGoal, updateGoalMetadata } from "../database/goals.js";
 import { getRecentMessages, getMessagesInRange } from "../database/messages.js";
 import { createLogger } from "./logger.js";
 
@@ -135,10 +135,7 @@ async function tryReminder(userId: number, text: string): Promise<CommandResult>
 
     // Update metadata with deadline if we have one
     if (deadline) {
-      await client
-        .from("goals")
-        .update({ metadata })
-        .eq("id", goal.id);
+      await updateGoalMetadata(client, goal.id, metadata);
     }
 
     const timeStr = deadline

@@ -1,15 +1,15 @@
 /**
  * User Facts Repository
  *
- * Stores and retrieves facts about users for personalization.
- * Facts can be preferences, context, relationships, or habits.
+ * Stores facts about users for personalization. Backed by local SQLite
+ * (bun:sqlite). Relevance search is computed in JS via cosine similarity over
+ * stored embeddings (replaces the former pgvector RPC).
  */
 
-import type {
-  SupabaseClient,
-  UserFactRow,
-  RelevantFact,
-} from "./supabase.js";
+import type { BotDatabase } from "./sqlite.js";
+import type { UserFactRow, RelevantFact } from "./supabase.js";
+import { cosineSimilarity } from "../services/embeddings.js";
+import { newId, nowIso, parseVector, serializeVector } from "./util.js";
 
 /**
  * Fact types for categorization
@@ -24,21 +24,47 @@ export type FactType =
   | "constraint"
   | "other";
 
+interface FactDbRow {
+  id: string;
+  telegram_user_id: number;
+  fact_type: string;
+  fact_text: string;
+  confidence: number;
+  source: string | null;
+  source_message_id: string | null;
+  created_at: string;
+  updated_at: string;
+  last_accessed_at: string;
+  access_count: number;
+  embedding: string | null;
+}
+
+function mapFact(r: FactDbRow): UserFactRow {
+  return {
+    id: r.id,
+    telegram_user_id: r.telegram_user_id,
+    fact_type: r.fact_type,
+    fact_text: r.fact_text,
+    confidence: r.confidence,
+    source: r.source ?? undefined,
+    source_message_id: r.source_message_id ?? undefined,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    last_accessed_at: r.last_accessed_at,
+    access_count: r.access_count,
+    embedding: parseVector(r.embedding),
+  };
+}
+
+function clampConfidence(c: number): number {
+  return Math.max(1, Math.min(10, Math.round(c)));
+}
+
 /**
- * Creates or updates a user fact
- * Uses upsert to handle the unique constraint on (user_id, type, text)
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param factType - Type of fact
- * @param factText - The fact text
- * @param confidence - Confidence score 1-10
- * @param source - Where this fact came from
- * @param embedding - Optional pre-computed embedding
- * @returns Created or updated fact row
+ * Creates or updates a user fact (unique on user_id + type + text).
  */
 export async function upsertUserFact(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   factType: FactType,
   factText: string,
@@ -46,247 +72,230 @@ export async function upsertUserFact(
   source?: string,
   embedding?: number[],
 ): Promise<UserFactRow | null> {
-  const { data, error } = await client
-    .from("user_facts")
-    .upsert(
-      {
-        telegram_user_id: userId,
-        fact_type: factType,
-        fact_text: factText,
-        confidence: Math.max(1, Math.min(10, confidence)),
-        source,
-        embedding: embedding ?? null,
-        last_accessed_at: new Date().toISOString(),
-      },
-      {
-        onConflict: "telegram_user_id,fact_type,fact_text",
-        ignoreDuplicates: false,
-      },
-    )
-    .select()
-    .maybeSingle();
+  try {
+    const ts = nowIso();
+    db.query(
+      `INSERT INTO user_facts
+        (id, telegram_user_id, fact_type, fact_text, confidence, source, embedding,
+         created_at, updated_at, last_accessed_at, access_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT (telegram_user_id, fact_type, fact_text)
+       DO UPDATE SET
+         confidence = excluded.confidence,
+         source = excluded.source,
+         embedding = excluded.embedding,
+         last_accessed_at = excluded.last_accessed_at,
+         updated_at = excluded.updated_at`,
+    ).run(
+      newId(),
+      userId,
+      factType,
+      factText,
+      clampConfidence(confidence),
+      source ?? null,
+      serializeVector(embedding),
+      ts,
+      ts,
+      ts,
+    );
 
-  if (error) {
+    const row = db
+      .query(
+        "SELECT * FROM user_facts WHERE telegram_user_id = ? AND fact_type = ? AND fact_text = ?",
+      )
+      .get(userId, factType, factText) as FactDbRow | null;
+    return row ? mapFact(row) : null;
+  } catch (error) {
     console.error("[db:facts] Failed to upsert fact:", error);
     return null;
   }
-
-  return data;
 }
 
 /**
- * Retrieves all facts for a user, optionally filtered by type
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param factType - Optional type filter
- * @param minConfidence - Minimum confidence threshold
- * @returns Array of fact rows
+ * Retrieves facts for a user, optionally filtered by type, ordered by
+ * confidence desc. Increments the access count of returned rows.
  */
 export async function getUserFacts(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   factType?: FactType,
   minConfidence = 1,
 ): Promise<UserFactRow[]> {
-  let query = client
-    .from("user_facts")
-    .select("*")
-    .eq("telegram_user_id", userId)
-    .gte("confidence", minConfidence);
+  try {
+    const rows = factType
+      ? (db
+          .query(
+            "SELECT * FROM user_facts WHERE telegram_user_id = ? AND confidence >= ? AND fact_type = ? ORDER BY confidence DESC, rowid ASC",
+          )
+          .all(userId, minConfidence, factType) as FactDbRow[])
+      : (db
+          .query(
+            "SELECT * FROM user_facts WHERE telegram_user_id = ? AND confidence >= ? ORDER BY confidence DESC, rowid ASC",
+          )
+          .all(userId, minConfidence) as FactDbRow[]);
 
-  if (factType) {
-    query = query.eq("fact_type", factType);
-  }
+    if (rows.length > 0) {
+      const ts = nowIso();
+      const bump = db.query(
+        "UPDATE user_facts SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
+      );
+      const tx = db.transaction(() => {
+        for (const r of rows) bump.run(ts, r.id);
+      });
+      tx();
+    }
 
-  const { data, error } = await query.order("confidence", { ascending: false });
-
-  if (error) {
+    return rows.map(mapFact);
+  } catch (error) {
     console.error("[db:facts] Failed to retrieve facts:", error);
     return [];
   }
-
-  // Update access count
-  for (const fact of data ?? []) {
-    await client
-      .from("user_facts")
-      .update({
-        last_accessed_at: new Date().toISOString(),
-        access_count: (fact.access_count ?? 0) + 1,
-      })
-      .eq("id", fact.id);
-  }
-
-  return data ?? [];
 }
 
 /**
- * Gets facts of a specific type for a user
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param factType - Type of facts to retrieve
- * @returns Array of facts of the specified type
+ * Gets facts of a specific type for a user.
  */
 export async function getFactsByType(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   factType: FactType,
 ): Promise<UserFactRow[]> {
-  return getUserFacts(client, userId, factType);
+  return getUserFacts(db, userId, factType);
 }
 
 /**
- * Performs semantic search to find facts relevant to a query
- *
- * @param client - Supabase client
- * @param queryEmbedding - Query embedding vector
- * @param userId - Telegram user ID
- * @param limit - Maximum results
- * @param threshold - Minimum similarity threshold
- * @returns Relevant facts with similarity scores
+ * Finds facts relevant to a query embedding (JS cosine similarity).
  */
 export async function searchRelevantFacts(
-  client: SupabaseClient,
+  db: BotDatabase,
   queryEmbedding: number[],
   userId: number,
   limit = 10,
   threshold = 0.65,
 ): Promise<RelevantFact[]> {
-  const { data, error } = await client.rpc("search_relevant_facts", {
-    query_embedding: JSON.stringify(queryEmbedding),
-    target_user_id: userId,
-    limit_count: limit,
-    similarity_threshold: threshold,
-  });
+  try {
+    const rows = db
+      .query(
+        `SELECT id, fact_type, fact_text, confidence, embedding
+         FROM user_facts
+         WHERE telegram_user_id = ? AND embedding IS NOT NULL`,
+      )
+      .all(userId) as Array<{
+      id: string;
+      fact_type: string;
+      fact_text: string;
+      confidence: number;
+      embedding: string | null;
+    }>;
 
-  if (error) {
+    const scored: RelevantFact[] = [];
+    for (const r of rows) {
+      const emb = parseVector(r.embedding);
+      if (!emb || emb.length !== queryEmbedding.length) continue;
+      const similarity = cosineSimilarity(queryEmbedding, emb);
+      if (similarity >= threshold) {
+        scored.push({
+          id: r.id,
+          fact_type: r.fact_type,
+          fact_text: r.fact_text,
+          confidence: r.confidence,
+          similarity,
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.similarity - a.similarity);
+    return scored.slice(0, limit);
+  } catch (error) {
     console.error("[db:facts] Semantic search failed:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Updates a fact's confidence score
- *
- * @param client - Supabase client
- * @param factId - Fact ID to update
- * @param confidence - New confidence score 1-10
- * @returns True if successful
+ * Updates a fact's confidence score (clamped 1-10).
  */
 export async function updateFactConfidence(
-  client: SupabaseClient,
+  db: BotDatabase,
   factId: string,
   confidence: number,
 ): Promise<boolean> {
-  const { error } = await client
-    .from("user_facts")
-    .update({ confidence: Math.max(1, Math.min(10, confidence)) })
-    .eq("id", factId);
-
-  if (error) {
+  try {
+    const result = db
+      .query("UPDATE user_facts SET confidence = ?, updated_at = ? WHERE id = ?")
+      .run(clampConfidence(confidence), nowIso(), factId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:facts] Failed to update confidence:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Updates a fact's embedding
- *
- * @param client - Supabase client
- * @param factId - Fact ID to update
- * @param embedding - New embedding vector
- * @returns True if successful
+ * Updates a fact's embedding.
  */
 export async function updateFactEmbedding(
-  client: SupabaseClient,
+  db: BotDatabase,
   factId: string,
   embedding: number[],
 ): Promise<boolean> {
-  const { error } = await client
-    .from("user_facts")
-    .update({ embedding })
-    .eq("id", factId);
-
-  if (error) {
+  try {
+    const result = db
+      .query("UPDATE user_facts SET embedding = ?, updated_at = ? WHERE id = ?")
+      .run(serializeVector(embedding), nowIso(), factId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:facts] Failed to update embedding:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Deletes a fact
- *
- * @param client - Supabase client
- * @param factId - Fact ID to delete
- * @returns True if successful
+ * Deletes a fact.
  */
 export async function deleteFact(
-  client: SupabaseClient,
+  db: BotDatabase,
   factId: string,
 ): Promise<boolean> {
-  const { error } = await client
-    .from("user_facts")
-    .delete()
-    .eq("id", factId);
-
-  if (error) {
+  try {
+    const result = db.query("DELETE FROM user_facts WHERE id = ?").run(factId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:facts] Failed to delete fact:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Deletes all facts of a specific type for a user
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param factType - Type of facts to delete
- * @returns Number of facts deleted
+ * Deletes all facts of a specific type for a user. Returns the count deleted.
  */
 export async function deleteFactsByType(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   factType: FactType,
 ): Promise<number> {
-  const { data, error } = await client
-    .from("user_facts")
-    .delete()
-    .eq("telegram_user_id", userId)
-    .eq("fact_type", factType)
-    .select("*");
-
-  if (error) {
+  try {
+    const result = db
+      .query(
+        "DELETE FROM user_facts WHERE telegram_user_id = ? AND fact_type = ?",
+      )
+      .run(userId, factType);
+    return result.changes;
+  } catch (error) {
     console.error("[db:facts] Failed to delete facts by type:", error);
     return 0;
   }
-
-  return data?.length ?? 0;
 }
 
 /**
- * Gets a summary of all facts for a user
- * Useful for building context for LLM prompts
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param minConfidence - Minimum confidence threshold
- * @returns Formatted facts string
+ * Gets a formatted summary of a user's facts for LLM prompting.
  */
 export async function getFactsSummary(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   minConfidence = 5,
 ): Promise<string> {
-  const facts = await getUserFacts(client, userId, undefined, minConfidence);
+  const facts = await getUserFacts(db, userId, undefined, minConfidence);
 
   if (facts.length === 0) {
     return "";
@@ -305,24 +314,22 @@ export async function getFactsSummary(
   // Format as structured text
   const sections: string[] = [];
   for (const [type, typeFacts] of grouped) {
-    const factStrings = typeFacts.map((f) => `- ${f.fact_text} (confidence: ${f.confidence})`);
-    sections.push(`**${type.charAt(0).toUpperCase() + type.slice(1)}s:**\n${factStrings.join("\n")}`);
+    const factStrings = typeFacts.map(
+      (f) => `- ${f.fact_text} (confidence: ${f.confidence})`,
+    );
+    sections.push(
+      `**${type.charAt(0).toUpperCase() + type.slice(1)}s:**\n${factStrings.join("\n")}`,
+    );
   }
 
   return `## User Facts\n\n${sections.join("\n\n")}`;
 }
 
 /**
- * Infers and stores facts from a conversation
- * This is a convenience function for fact extraction
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param facts - Array of inferred facts
- * @returns Number of facts stored
+ * Infers and stores facts from a conversation. Returns the number stored.
  */
 export async function storeInferredFacts(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   facts: Array<{
     type: FactType;
@@ -334,7 +341,7 @@ export async function storeInferredFacts(
 
   for (const fact of facts) {
     const result = await upsertUserFact(
-      client,
+      db,
       userId,
       fact.type,
       fact.text,

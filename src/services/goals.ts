@@ -13,6 +13,7 @@ import { invokeClaudeCode } from "../relay.js";
 import {
   createGoal,
   getActiveGoals as dbGetActiveGoals,
+  getAllActiveGoals as dbGetAllActiveGoals,
   updateGoalStatus as dbUpdateGoalStatus,
 } from "../database/goals.js";
 import { getSupabaseClient } from "../database/supabase.js";
@@ -195,18 +196,10 @@ export class GoalService {
     const client = getSupabaseClient();
     const approaching: ApproachingDeadline[] = [];
 
-    // Query all active goals that have metadata (where deadline might be stored)
-    const { data: activeGoals, error } = await client
-      .from("goals")
-      .select("*")
-      .eq("status", "active");
+    // All active goals across users (deadlines are stored in goal metadata)
+    const activeGoals = await dbGetAllActiveGoals(client);
 
-    if (error) {
-      console.error(`${LOG_PREFIX} Failed to check deadlines:`, error);
-      return [];
-    }
-
-    if (!activeGoals || activeGoals.length === 0) {
+    if (activeGoals.length === 0) {
       return [];
     }
 

@@ -1,30 +1,67 @@
 /**
  * Goals Repository
  *
- * Manages user goals with semantic search capabilities.
- * Goals can be prioritized, categorized, and searched by relevance.
+ * Manages user goals with semantic search. Backed by local SQLite (bun:sqlite).
+ * Relevance search is computed in JS via cosine similarity over stored
+ * embeddings (replaces the former pgvector RPC).
  */
 
-import type {
-  SupabaseClient,
-  GoalRow,
-  RelevantGoal,
-} from "./supabase.js";
+import type { BotDatabase } from "./sqlite.js";
+import type { GoalRow, RelevantGoal } from "./supabase.js";
+import { cosineSimilarity } from "../services/embeddings.js";
+import {
+  newId,
+  nowIso,
+  parseJson,
+  parseVector,
+  serializeJson,
+  serializeVector,
+} from "./util.js";
+
+interface GoalDbRow {
+  id: string;
+  telegram_user_id: number;
+  title: string;
+  description: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  priority: number;
+  category: string | null;
+  embedding: string | null;
+  metadata: string;
+}
+
+function mapGoal(r: GoalDbRow): GoalRow {
+  return {
+    id: r.id,
+    telegram_user_id: r.telegram_user_id,
+    title: r.title,
+    description: r.description ?? undefined,
+    status: r.status as GoalRow["status"],
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    completed_at: r.completed_at ?? undefined,
+    priority: r.priority,
+    category: r.category ?? undefined,
+    embedding: parseVector(r.embedding),
+    metadata: parseJson(r.metadata),
+  };
+}
+
+function getGoalById(db: BotDatabase, id: string): GoalRow | null {
+  const row = db
+    .query("SELECT * FROM goals WHERE id = ?")
+    .get(id) as GoalDbRow | null;
+  return row ? mapGoal(row) : null;
+}
 
 /**
- * Creates a new goal for a user
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param title - Goal title
- * @param description - Optional detailed description
- * @param priority - Priority 1-10 (default: 5)
- * @param category - Optional category label
- * @param embedding - Optional pre-computed embedding
- * @returns Created goal row or null
+ * Creates a new goal for a user.
  */
 export async function createGoal(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   title: string,
   description?: string,
@@ -32,269 +69,272 @@ export async function createGoal(
   category?: string,
   embedding?: number[],
 ): Promise<GoalRow | null> {
-  const { data, error } = await client
-    .from("goals")
-    .insert({
-      telegram_user_id: userId,
+  try {
+    const id = newId();
+    const ts = nowIso();
+    db.query(
+      `INSERT INTO goals
+        (id, telegram_user_id, title, description, status, created_at, updated_at, priority, category, embedding, metadata)
+       VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, '{}')`,
+    ).run(
+      id,
+      userId,
       title,
-      description,
+      description ?? null,
+      ts,
+      ts,
       priority,
-      category,
-      embedding: embedding ?? null,
-    })
-    .select()
-    .maybeSingle();
-
-  if (error) {
+      category ?? null,
+      serializeVector(embedding),
+    );
+    return getGoalById(db, id);
+  } catch (error) {
     console.error("[db:goals] Failed to create goal:", error);
     return null;
   }
-
-  return data;
 }
 
 /**
- * Retrieves all goals for a user, optionally filtered by status
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param status - Optional status filter
- * @returns Array of goal rows
+ * Retrieves goals for a user, optionally filtered by status, priority desc.
  */
 export async function getGoals(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   status?: "active" | "completed" | "archived",
 ): Promise<GoalRow[]> {
-  let query = client
-    .from("goals")
-    .select("*")
-    .eq("telegram_user_id", userId);
-
-  if (status) {
-    query = query.eq("status", status);
-  }
-
-  const { data, error } = await query.order("priority", { ascending: false });
-
-  if (error) {
+  try {
+    const rows = status
+      ? (db
+          .query(
+            "SELECT * FROM goals WHERE telegram_user_id = ? AND status = ? ORDER BY priority DESC, rowid ASC",
+          )
+          .all(userId, status) as GoalDbRow[])
+      : (db
+          .query(
+            "SELECT * FROM goals WHERE telegram_user_id = ? ORDER BY priority DESC, rowid ASC",
+          )
+          .all(userId) as GoalDbRow[]);
+    return rows.map(mapGoal);
+  } catch (error) {
     console.error("[db:goals] Failed to retrieve goals:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Gets active goals for a user
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @returns Array of active goals
+ * Gets active goals for a user.
  */
 export async function getActiveGoals(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
 ): Promise<GoalRow[]> {
-  return getGoals(client, userId, "active");
+  return getGoals(db, userId, "active");
 }
 
 /**
- * Updates a goal's status
- *
- * @param client - Supabase client
- * @param goalId - Goal ID to update
- * @param status - New status
- * @returns True if successful
+ * Gets active goals across all users (used by the deadline checker).
+ */
+export async function getAllActiveGoals(db: BotDatabase): Promise<GoalRow[]> {
+  try {
+    const rows = db
+      .query(
+        "SELECT * FROM goals WHERE status = 'active' ORDER BY priority DESC, rowid ASC",
+      )
+      .all() as GoalDbRow[];
+    return rows.map(mapGoal);
+  } catch (error) {
+    console.error("[db:goals] Failed to retrieve all active goals:", error);
+    return [];
+  }
+}
+
+/**
+ * Replaces a goal's metadata object.
+ */
+export async function updateGoalMetadata(
+  db: BotDatabase,
+  goalId: string,
+  metadata: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    const result = db
+      .query("UPDATE goals SET metadata = ?, updated_at = ? WHERE id = ?")
+      .run(serializeJson(metadata), nowIso(), goalId);
+    return result.changes > 0;
+  } catch (error) {
+    console.error("[db:goals] Failed to update metadata:", error);
+    return false;
+  }
+}
+
+/**
+ * Updates a goal's status. Sets completed_at when completing.
  */
 export async function updateGoalStatus(
-  client: SupabaseClient,
+  db: BotDatabase,
   goalId: string,
   status: "active" | "completed" | "archived",
 ): Promise<boolean> {
-  const updates: Partial<GoalRow> = { status };
-
-  if (status === "completed") {
-    (updates as unknown as { completed_at: string }).completed_at =
-      new Date().toISOString();
-  }
-
-  const { error } = await client
-    .from("goals")
-    .update(updates)
-    .eq("id", goalId);
-
-  if (error) {
+  try {
+    const ts = nowIso();
+    const result =
+      status === "completed"
+        ? db
+            .query(
+              "UPDATE goals SET status = ?, completed_at = ?, updated_at = ? WHERE id = ?",
+            )
+            .run(status, ts, ts, goalId)
+        : db
+            .query("UPDATE goals SET status = ?, updated_at = ? WHERE id = ?")
+            .run(status, ts, goalId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:goals] Failed to update status:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Marks a goal as completed
- *
- * @param client - Supabase client
- * @param goalId - Goal ID to complete
- * @returns True if successful
+ * Marks a goal as completed.
  */
 export async function completeGoal(
-  client: SupabaseClient,
+  db: BotDatabase,
   goalId: string,
 ): Promise<boolean> {
-  return updateGoalStatus(client, goalId, "completed");
+  return updateGoalStatus(db, goalId, "completed");
 }
 
 /**
- * Archives a goal
- *
- * @param client - Supabase client
- * @param goalId - Goal ID to archive
- * @returns True if successful
+ * Archives a goal.
  */
 export async function archiveGoal(
-  client: SupabaseClient,
+  db: BotDatabase,
   goalId: string,
 ): Promise<boolean> {
-  return updateGoalStatus(client, goalId, "archived");
+  return updateGoalStatus(db, goalId, "archived");
 }
 
 /**
- * Updates a goal's embedding
- *
- * @param client - Supabase client
- * @param goalId - Goal ID to update
- * @param embedding - New embedding vector
- * @returns True if successful
+ * Updates a goal's embedding.
  */
 export async function updateGoalEmbedding(
-  client: SupabaseClient,
+  db: BotDatabase,
   goalId: string,
   embedding: number[],
 ): Promise<boolean> {
-  const { error } = await client
-    .from("goals")
-    .update({ embedding })
-    .eq("id", goalId);
-
-  if (error) {
+  try {
+    const result = db
+      .query("UPDATE goals SET embedding = ?, updated_at = ? WHERE id = ?")
+      .run(serializeVector(embedding), nowIso(), goalId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:goals] Failed to update embedding:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Performs semantic search to find goals relevant to a query
- *
- * @param client - Supabase client
- * @param queryEmbedding - Query embedding vector
- * @param userId - Telegram user ID
- * @param limit - Maximum results
- * @param threshold - Minimum similarity threshold
- * @returns Relevant goals with similarity scores
+ * Finds active goals relevant to a query embedding (JS cosine similarity).
  */
 export async function searchRelevantGoals(
-  client: SupabaseClient,
+  db: BotDatabase,
   queryEmbedding: number[],
   userId: number,
   limit = 5,
   threshold = 0.6,
 ): Promise<RelevantGoal[]> {
-  const { data, error } = await client.rpc("search_relevant_goals", {
-    query_embedding: JSON.stringify(queryEmbedding),
-    target_user_id: userId,
-    limit_count: limit,
-    similarity_threshold: threshold,
-  });
+  try {
+    const rows = db
+      .query(
+        `SELECT id, title, description, status, embedding
+         FROM goals
+         WHERE telegram_user_id = ? AND status = 'active' AND embedding IS NOT NULL`,
+      )
+      .all(userId) as Array<{
+      id: string;
+      title: string;
+      description: string | null;
+      status: string;
+      embedding: string | null;
+    }>;
 
-  if (error) {
+    const scored: RelevantGoal[] = [];
+    for (const r of rows) {
+      const emb = parseVector(r.embedding);
+      if (!emb || emb.length !== queryEmbedding.length) continue;
+      const similarity = cosineSimilarity(queryEmbedding, emb);
+      if (similarity >= threshold) {
+        scored.push({
+          id: r.id,
+          title: r.title,
+          description: r.description ?? undefined,
+          status: r.status,
+          similarity,
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.similarity - a.similarity);
+    return scored.slice(0, limit);
+  } catch (error) {
     console.error("[db:goals] Semantic search failed:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Deletes a goal
- *
- * @param client - Supabase client
- * @param goalId - Goal ID to delete
- * @returns True if successful
+ * Deletes a goal.
  */
 export async function deleteGoal(
-  client: SupabaseClient,
+  db: BotDatabase,
   goalId: string,
 ): Promise<boolean> {
-  const { error } = await client
-    .from("goals")
-    .delete()
-    .eq("id", goalId);
-
-  if (error) {
+  try {
+    const result = db.query("DELETE FROM goals WHERE id = ?").run(goalId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:goals] Failed to delete goal:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Gets goals by category
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param category - Category to filter by
- * @returns Array of goals in the category
+ * Gets goals by category (priority desc).
  */
 export async function getGoalsByCategory(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   category: string,
 ): Promise<GoalRow[]> {
-  const { data, error } = await client
-    .from("goals")
-    .select("*")
-    .eq("telegram_user_id", userId)
-    .eq("category", category)
-    .order("priority", { ascending: false });
-
-  if (error) {
+  try {
+    const rows = db
+      .query(
+        "SELECT * FROM goals WHERE telegram_user_id = ? AND category = ? ORDER BY priority DESC, rowid ASC",
+      )
+      .all(userId, category) as GoalDbRow[];
+    return rows.map(mapGoal);
+  } catch (error) {
     console.error("[db:goals] Failed to get goals by category:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Gets all categories for a user's goals
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @returns Array of unique category names
+ * Gets all unique category names for a user's goals.
  */
 export async function getGoalCategories(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
 ): Promise<string[]> {
-  const { data, error } = await client
-    .from("goals")
-    .select("category")
-    .eq("telegram_user_id", userId)
-    .not("category", "is", null);
-
-  if (error) {
+  try {
+    const rows = db
+      .query(
+        "SELECT DISTINCT category FROM goals WHERE telegram_user_id = ? AND category IS NOT NULL",
+      )
+      .all(userId) as Array<{ category: string }>;
+    return rows.map((r) => r.category);
+  } catch (error) {
     console.error("[db:goals] Failed to get categories:", error);
     return [];
   }
-
-  const categories = new Set(
-    (data ?? []).map((g: { category: string | null }) => g.category).filter((c): c is string => c !== null),
-  );
-
-  return [...categories];
 }

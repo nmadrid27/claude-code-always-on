@@ -1,15 +1,22 @@
 /**
  * Message Repository
  *
- * Handles all database operations for storing and retrieving messages
- * with semantic search capabilities using pgvector.
+ * Stores and retrieves messages with semantic search. Backed by local SQLite
+ * (bun:sqlite). Similarity search is computed in JS via cosine similarity over
+ * stored embedding vectors (replaces the former pgvector RPCs).
  */
 
-import type {
-  SupabaseClient,
-  MessageRow,
-  SimilarMessage,
-} from "./supabase.js";
+import type { BotDatabase } from "./sqlite.js";
+import type { MessageRow, SimilarMessage } from "./supabase.js";
+import { cosineSimilarity } from "../services/embeddings.js";
+import {
+  newId,
+  nowIso,
+  parseJson,
+  parseVector,
+  serializeJson,
+  serializeVector,
+} from "./util.js";
 
 /**
  * Result type for paginated message queries
@@ -20,20 +27,44 @@ export interface MessagePaginationResult {
   totalCount?: number;
 }
 
+interface MessageDbRow {
+  id: string;
+  telegram_user_id: number;
+  telegram_message_id: number | null;
+  role: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+  embedding: string | null;
+  metadata: string;
+}
+
+function mapMessage(r: MessageDbRow): MessageRow {
+  return {
+    id: r.id,
+    telegram_user_id: r.telegram_user_id,
+    telegram_message_id: r.telegram_message_id ?? undefined,
+    role: r.role as MessageRow["role"],
+    content: r.content,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    embedding: parseVector(r.embedding),
+    metadata: parseJson(r.metadata),
+  };
+}
+
+function getMessageById(db: BotDatabase, id: string): MessageRow | null {
+  const row = db
+    .query("SELECT * FROM messages WHERE id = ?")
+    .get(id) as MessageDbRow | null;
+  return row ? mapMessage(row) : null;
+}
+
 /**
- * Stores a new message in the database
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param role - Message role (user, assistant, system)
- * @param content - Message content
- * @param embedding - Optional pre-computed embedding vector
- * @param metadata - Optional metadata JSON
- * @param telegramMessageId - Optional Telegram message ID
- * @returns The created message row or null
+ * Stores a new message in the database.
  */
 export async function storeMessage(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   role: "user" | "assistant" | "system",
   content: string,
@@ -41,36 +72,36 @@ export async function storeMessage(
   metadata?: Record<string, unknown>,
   telegramMessageId?: number,
 ): Promise<MessageRow | null> {
-  const { data, error } = await client
-    .from("messages")
-    .insert({
-      telegram_user_id: userId,
-      telegram_message_id: telegramMessageId,
+  try {
+    const id = newId();
+    const ts = nowIso();
+    db.query(
+      `INSERT INTO messages
+        (id, telegram_user_id, telegram_message_id, role, content, created_at, updated_at, embedding, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      userId,
+      telegramMessageId ?? null,
       role,
       content,
-      embedding: embedding ?? null,
-      metadata: metadata ?? {},
-    })
-    .select()
-    .maybeSingle();
-
-  if (error) {
+      ts,
+      ts,
+      serializeVector(embedding),
+      serializeJson(metadata),
+    );
+    return getMessageById(db, id);
+  } catch (error) {
     console.error("[db:messages] Failed to store message:", error);
     return null;
   }
-
-  return data;
 }
 
 /**
- * Stores multiple messages in a single batch operation
- *
- * @param client - Supabase client
- * @param messages - Array of message data to insert
- * @returns Array of created message rows
+ * Stores multiple messages in a single transaction.
  */
 export async function storeMessages(
-  client: SupabaseClient,
+  db: BotDatabase,
   messages: Array<{
     userId: number;
     role: "user" | "assistant" | "system";
@@ -84,211 +115,209 @@ export async function storeMessages(
     return [];
   }
 
-  const rows = messages.map((m) => ({
-    telegram_user_id: m.userId,
-    telegram_message_id: m.telegramMessageId,
-    role: m.role,
-    content: m.content,
-    embedding: m.embedding ?? null,
-    metadata: m.metadata ?? {},
-  }));
-
-  const { data, error } = await client
-    .from("messages")
-    .insert(rows)
-    .select();
-
-  if (error) {
+  try {
+    const ids: string[] = [];
+    const insert = db.query(
+      `INSERT INTO messages
+        (id, telegram_user_id, telegram_message_id, role, content, created_at, updated_at, embedding, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const tx = db.transaction(() => {
+      for (const m of messages) {
+        const id = newId();
+        const ts = nowIso();
+        insert.run(
+          id,
+          m.userId,
+          m.telegramMessageId ?? null,
+          m.role,
+          m.content,
+          ts,
+          ts,
+          serializeVector(m.embedding),
+          serializeJson(m.metadata),
+        );
+        ids.push(id);
+      }
+    });
+    tx();
+    return ids
+      .map((id) => getMessageById(db, id))
+      .filter((m): m is MessageRow => m !== null);
+  } catch (error) {
     console.error("[db:messages] Failed to store messages batch:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Retrieves recent messages for a user
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param limit - Maximum number of messages to retrieve
- * @param offset - Number of messages to skip (for pagination)
- * @returns Paginated messages with metadata
+ * Retrieves recent messages for a user (newest first), with pagination.
  */
 export async function getRecentMessages(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   limit = 50,
   offset = 0,
 ): Promise<MessagePaginationResult> {
-  const { data, error, count } = await client
-    .from("messages")
-    .select("*", { count: "exact" })
-    .eq("telegram_user_id", userId)
-    .order("created_at", { ascending: false })
-    .range(offset, offset + limit - 1);
+  try {
+    const countRow = db
+      .query("SELECT COUNT(*) AS c FROM messages WHERE telegram_user_id = ?")
+      .get(userId) as { c: number };
 
-  if (error) {
+    const rows = db
+      .query(
+        `SELECT * FROM messages
+         WHERE telegram_user_id = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(userId, limit, offset) as MessageDbRow[];
+
+    return {
+      messages: rows.map(mapMessage),
+      hasMore: rows.length === limit,
+      totalCount: countRow.c,
+    };
+  } catch (error) {
     console.error("[db:messages] Failed to retrieve messages:", error);
     return { messages: [], hasMore: false };
   }
-
-  return {
-    messages: data ?? [],
-    hasMore: (data?.length ?? 0) === limit,
-    totalCount: count ?? undefined,
-  };
 }
 
 /**
- * Retrieves conversation history within a date range
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param startDate - Start of date range
- * @param endDate - End of date range
- * @returns Messages within the specified range
+ * Retrieves conversation history within a date range (chronological order).
  */
 export async function getMessagesInRange(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   startDate: Date,
   endDate: Date,
 ): Promise<MessageRow[]> {
-  const { data, error } = await client
-    .from("messages")
-    .select("*")
-    .eq("telegram_user_id", userId)
-    .gte("created_at", startDate.toISOString())
-    .lte("created_at", endDate.toISOString())
-    .order("created_at", { ascending: true });
-
-  if (error) {
+  try {
+    const rows = db
+      .query(
+        `SELECT * FROM messages
+         WHERE telegram_user_id = ? AND created_at >= ? AND created_at <= ?
+         ORDER BY created_at ASC, rowid ASC`,
+      )
+      .all(userId, startDate.toISOString(), endDate.toISOString()) as MessageDbRow[];
+    return rows.map(mapMessage);
+  } catch (error) {
     console.error("[db:messages] Failed to retrieve messages in range:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Updates a message's embedding vector
- * Useful when embeddings are computed asynchronously
- *
- * @param client - Supabase client
- * @param messageId - Message ID to update
- * @param embedding - Embedding vector
- * @returns True if successful
+ * Updates a message's embedding vector.
  */
 export async function updateMessageEmbedding(
-  client: SupabaseClient,
+  db: BotDatabase,
   messageId: string,
   embedding: number[],
 ): Promise<boolean> {
-  const { error } = await client
-    .from("messages")
-    .update({ embedding })
-    .eq("id", messageId);
-
-  if (error) {
+  try {
+    const result = db
+      .query("UPDATE messages SET embedding = ?, updated_at = ? WHERE id = ?")
+      .run(serializeVector(embedding), nowIso(), messageId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:messages] Failed to update embedding:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Performs semantic search to find similar messages
- *
- * @param client - Supabase client
- * @param queryEmbedding - Query embedding vector
- * @param userId - Optional user ID to filter by
- * @param limit - Maximum results
- * @param threshold - Minimum similarity threshold (0-1)
- * @returns Similar messages with similarity scores
+ * Finds messages most similar to a query embedding using JS cosine similarity.
  */
 export async function searchSimilarMessages(
-  client: SupabaseClient,
+  db: BotDatabase,
   queryEmbedding: number[],
   userId?: number,
   limit = 10,
   threshold = 0.7,
 ): Promise<SimilarMessage[]> {
-  const { data, error } = await client.rpc("search_similar_messages", {
-    query_embedding: JSON.stringify(queryEmbedding),
-    target_user_id: userId ?? null,
-    limit_count: limit,
-    similarity_threshold: threshold,
-  });
+  try {
+    const rows = db
+      .query(
+        `SELECT id, telegram_user_id, role, content, embedding
+         FROM messages
+         WHERE embedding IS NOT NULL
+         ${userId != null ? "AND telegram_user_id = ?" : ""}`,
+      )
+      .all(...(userId != null ? [userId] : [])) as Array<{
+      id: string;
+      telegram_user_id: number;
+      role: string;
+      content: string;
+      embedding: string | null;
+    }>;
 
-  if (error) {
+    const scored: SimilarMessage[] = [];
+    for (const r of rows) {
+      const emb = parseVector(r.embedding);
+      if (!emb || emb.length !== queryEmbedding.length) continue;
+      const similarity = cosineSimilarity(queryEmbedding, emb);
+      if (similarity >= threshold) {
+        scored.push({
+          id: r.id,
+          telegram_user_id: r.telegram_user_id,
+          role: r.role,
+          content: r.content,
+          similarity,
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.similarity - a.similarity);
+    return scored.slice(0, limit);
+  } catch (error) {
     console.error("[db:messages] Semantic search failed:", error);
     return [];
   }
-
-  return data ?? [];
 }
 
 /**
- * Deletes a message by ID
- *
- * @param client - Supabase client
- * @param messageId - Message ID to delete
- * @returns True if successful
+ * Deletes a message by ID.
  */
 export async function deleteMessage(
-  client: SupabaseClient,
+  db: BotDatabase,
   messageId: string,
 ): Promise<boolean> {
-  const { error } = await client
-    .from("messages")
-    .delete()
-    .eq("id", messageId);
-
-  if (error) {
+  try {
+    const result = db
+      .query("DELETE FROM messages WHERE id = ?")
+      .run(messageId);
+    return result.changes > 0;
+  } catch (error) {
     console.error("[db:messages] Failed to delete message:", error);
     return false;
   }
-
-  return true;
 }
 
 /**
- * Deletes all messages for a user
- * Use with caution - this is irreversible
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @returns Number of messages deleted
+ * Deletes all messages for a user. Returns the number deleted.
  */
 export async function deleteAllUserMessages(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
 ): Promise<number> {
-  const { data, error } = await client
-    .from("messages")
-    .delete()
-    .eq("telegram_user_id", userId)
-    .select("*");
-
-  if (error) {
+  try {
+    const result = db
+      .query("DELETE FROM messages WHERE telegram_user_id = ?")
+      .run(userId);
+    return result.changes;
+  } catch (error) {
     console.error("[db:messages] Failed to delete user messages:", error);
     return 0;
   }
-
-  return data?.length ?? 0;
 }
 
 /**
- * Gets message statistics for a user
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @returns Statistics object
+ * Gets message statistics for a user.
  */
 export async function getMessageStats(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
 ): Promise<{
   total: number;
@@ -297,53 +326,47 @@ export async function getMessageStats(
   system: number;
   withEmbeddings: number;
 }> {
-  // Get total counts by role
-  const { data: roleData, error: roleError } = await client
-    .from("messages")
-    .select("role")
-    .eq("telegram_user_id", userId);
+  try {
+    const row = db
+      .query(
+        `SELECT
+           COUNT(*) AS total,
+           SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user,
+           SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant,
+           SUM(CASE WHEN role = 'system' THEN 1 ELSE 0 END) AS system,
+           SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) AS withEmbeddings
+         FROM messages WHERE telegram_user_id = ?`,
+      )
+      .get(userId) as {
+      total: number;
+      user: number | null;
+      assistant: number | null;
+      system: number | null;
+      withEmbeddings: number | null;
+    };
 
-  if (roleError) {
-    console.error("[db:messages] Failed to get stats:", roleError);
+    return {
+      total: row.total,
+      user: row.user ?? 0,
+      assistant: row.assistant ?? 0,
+      system: row.system ?? 0,
+      withEmbeddings: row.withEmbeddings ?? 0,
+    };
+  } catch (error) {
+    console.error("[db:messages] Failed to get stats:", error);
     return { total: 0, user: 0, assistant: 0, system: 0, withEmbeddings: 0 };
   }
-
-  const messages = roleData ?? [];
-  const total = messages.length;
-  const user = messages.filter((m: { role: string }) => m.role === "user").length;
-  const assistant = messages.filter((m: { role: string }) => m.role === "assistant").length;
-  const system = messages.filter((m: { role: string }) => m.role === "system").length;
-
-  // Get count with embeddings
-  const { count: withEmbeddings } = await client
-    .from("messages")
-    .select("*", { count: "exact", head: true })
-    .eq("telegram_user_id", userId)
-    .not("embedding", "is", null);
-
-  return {
-    total,
-    user,
-    assistant,
-    system,
-    withEmbeddings: withEmbeddings ?? 0,
-  };
 }
 
 /**
- * Retrieves recent conversation context for LLM prompting
- *
- * @param client - Supabase client
- * @param userId - Telegram user ID
- * @param maxMessages - Maximum messages to include
- * @returns Formatted conversation string
+ * Retrieves recent conversation context formatted for LLM prompting.
  */
 export async function getConversationContext(
-  client: SupabaseClient,
+  db: BotDatabase,
   userId: number,
   maxMessages = 20,
 ): Promise<string> {
-  const { messages } = await getRecentMessages(client, userId, maxMessages);
+  const { messages } = await getRecentMessages(db, userId, maxMessages);
 
   if (messages.length === 0) {
     return "";

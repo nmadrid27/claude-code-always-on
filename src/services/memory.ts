@@ -1,30 +1,42 @@
 /**
  * Memory Service for Voice Context
  *
- * Provides context from Supabase memory for voice conversations.
- * Fetches recent messages, goals, and facts to inject into voice calls.
+ * Provides context from the local SQLite memory for voice conversations.
+ * Fetches recent messages, goals, and facts to inject into voice calls, and
+ * persists messages/goals/facts created during a call.
+ *
+ * Backed by the same SQLite tables as the text bot (see src/database/*), so
+ * voice and text share one memory. The public surface (fetchContext,
+ * storeMessage, fetchRecentMessages, etc.) is preserved from the previous
+ * Supabase-backed implementation.
  */
 
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { getDb, type BotDatabase } from "../database/sqlite.js";
 import { EmbeddingsService } from "./embeddings.js";
+import {
+  storeMessage as dbStoreMessage,
+  getRecentMessages as dbGetRecentMessages,
+  updateMessageEmbedding as dbUpdateMessageEmbedding,
+  searchSimilarMessages as dbSearchSimilarMessages,
+} from "../database/messages.js";
+import {
+  createGoal as dbCreateGoal,
+  getActiveGoals as dbGetActiveGoals,
+  updateGoalStatus as dbUpdateGoalStatus,
+  updateGoalMetadata as dbUpdateGoalMetadata,
+} from "../database/goals.js";
+import {
+  upsertUserFact as dbUpsertUserFact,
+  getUserFacts as dbGetUserFacts,
+  type FactType,
+} from "../database/user-facts.js";
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
 /**
- * Supabase configuration
- */
-export interface SupabaseConfig {
-  /** Supabase project URL */
-  url: string;
-
-  /** Supabase service role key (for server-side access) */
-  serviceKey: string;
-}
-
-/**
- * Stored message from database
+ * Stored message (voice service shape)
  */
 export interface StoredMessage {
   id: string;
@@ -33,30 +45,6 @@ export interface StoredMessage {
   role: "user" | "assistant";
   created_at: string;
   metadata?: Record<string, unknown>;
-}
-
-/**
- * Goal from database
- */
-export interface Goal {
-  id: string;
-  user_id: number;
-  description: string;
-  deadline: string | null;
-  status: "active" | "completed" | "cancelled";
-  created_at: string;
-}
-
-/**
- * User fact from database
- */
-export interface Fact {
-  id: string;
-  user_id: number;
-  key: string;
-  value: string;
-  confidence: number;
-  updated_at: string;
 }
 
 /**
@@ -85,31 +73,25 @@ export interface MemoryContext {
 // ============================================================================
 
 /**
- * Memory service for fetching context from Supabase
+ * Memory service for fetching/persisting context in the local SQLite database.
  */
 export class MemoryService {
-  private client: SupabaseClient;
+  private db: BotDatabase;
   private userId: number;
   private embeddingsService: EmbeddingsService | null;
 
-  constructor(config: SupabaseConfig, userId: number) {
-    this.client = createClient(config.url, config.serviceKey);
+  constructor(userId: number) {
+    this.db = getDb();
     this.userId = userId;
 
-    // Initialize embeddings service if VOYAGE_API_KEY is configured
-    const openaiKey = process.env.VOYAGE_API_KEY;
-    if (openaiKey) {
-      this.embeddingsService = new EmbeddingsService({ apiKey: openaiKey });
-    } else {
-      this.embeddingsService = null;
-    }
+    const voyageKey = process.env.VOYAGE_API_KEY;
+    this.embeddingsService = voyageKey
+      ? new EmbeddingsService({ apiKey: voyageKey })
+      : null;
   }
 
   /**
-   * Fetch full memory context for a voice call
-   *
-   * @param messageCount - Number of recent messages to fetch (default: 15)
-   * @returns Complete memory context
+   * Fetch full memory context for a voice call.
    */
   async fetchContext(messageCount: number = 15): Promise<MemoryContext> {
     const [recentMessages, goals, facts] = await Promise.all([
@@ -118,18 +100,11 @@ export class MemoryService {
       this.fetchFacts(),
     ]);
 
-    return {
-      recentMessages,
-      goals,
-      facts,
-    };
+    return { recentMessages, goals, facts };
   }
 
   /**
-   * Fetch recent messages from the database
-   *
-   * @param limit - Maximum number of messages to fetch
-   * @returns Array of recent messages
+   * Fetch recent messages (newest first), excluding system messages.
    */
   async fetchRecentMessages(limit: number = 15): Promise<
     Array<{
@@ -138,29 +113,18 @@ export class MemoryService {
       timestamp: number;
     }>
   > {
-    const { data, error } = await this.client
-      .from("messages")
-      .select("content, role, created_at")
-      .eq("user_id", this.userId)
-      .order("created_at", { ascending: false })
-      .limit(limit);
-
-    if (error) {
-      console.error("Error fetching recent messages:", error);
-      return [];
-    }
-
-    return (data || []).map((msg) => ({
-      role: msg.role as "user" | "assistant",
-      content: msg.content,
-      timestamp: new Date(msg.created_at).getTime(),
-    }));
+    const { messages } = await dbGetRecentMessages(this.db, this.userId, limit);
+    return messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+        timestamp: new Date(m.created_at).getTime(),
+      }));
   }
 
   /**
-   * Fetch active goals from the database
-   *
-   * @returns Array of active goals
+   * Fetch active goals. Deadlines (if any) are stored in goal metadata.
    */
   async fetchActiveGoals(): Promise<
     Array<{
@@ -169,29 +133,16 @@ export class MemoryService {
       status: string;
     }>
   > {
-    const { data, error } = await this.client
-      .from("goals")
-      .select("description, deadline, status")
-      .eq("user_id", this.userId)
-      .eq("status", "active")
-      .order("deadline", { ascending: true, nullsFirst: false });
-
-    if (error) {
-      console.error("Error fetching goals:", error);
-      return [];
-    }
-
-    return (data || []).map((goal) => ({
-      description: goal.description,
-      deadline: goal.deadline,
-      status: goal.status,
+    const goals = await dbGetActiveGoals(this.db, this.userId);
+    return goals.map((g) => ({
+      description: g.description ?? g.title,
+      deadline: (g.metadata?.deadline as string | undefined) ?? null,
+      status: g.status,
     }));
   }
 
   /**
-   * Fetch user facts from the database
-   *
-   * @returns Array of user facts
+   * Fetch user facts (key = fact_type, value = fact_text).
    */
   async fetchFacts(): Promise<
     Array<{
@@ -200,236 +151,155 @@ export class MemoryService {
       confidence: number;
     }>
   > {
-    const { data, error } = await this.client
-      .from("facts")
-      .select("key, value, confidence")
-      .eq("user_id", this.userId)
-      .order("confidence", { ascending: false });
-
-    if (error) {
-      console.error("Error fetching facts:", error);
-      return [];
-    }
-
-    return (data || []).map((fact) => ({
-      key: fact.key,
-      value: fact.value,
-      confidence: fact.confidence,
+    const facts = await dbGetUserFacts(this.db, this.userId, undefined, 1);
+    return facts.map((f) => ({
+      key: f.fact_type,
+      value: f.fact_text,
+      confidence: f.confidence,
     }));
   }
 
   /**
-   * Store a new message in the database
-   *
-   * @param content - Message content
-   * @param role - Message role (user or assistant)
-   * @param metadata - Optional metadata
+   * Store a new message. Generates and stores an embedding asynchronously
+   * (non-blocking) when an embeddings provider is configured.
    */
   async storeMessage(
     content: string,
     role: "user" | "assistant",
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
   ): Promise<void> {
-    const { data, error } = await this.client
-      .from("messages")
-      .insert({
-        user_id: this.userId,
-        content,
-        role,
-        metadata,
-      })
-      .select("id")
-      .single();
+    const row = await dbStoreMessage(
+      this.db,
+      this.userId,
+      role,
+      content,
+      undefined,
+      metadata,
+    );
 
-    if (error) {
-      console.error("Error storing message:", error);
-      throw error;
-    }
-
-    // Generate and store embedding asynchronously (non-blocking)
-    if (this.embeddingsService && data?.id) {
-      this.generateAndStoreEmbedding(data.id, content).catch((err) => {
+    if (this.embeddingsService && row?.id) {
+      this.generateAndStoreEmbedding(row.id, content).catch((err) => {
         console.warn("Failed to generate embedding for message:", err);
       });
     }
   }
 
-  /**
-   * Generate an embedding for content and store it on the message row.
-   * Runs async/non-blocking so it doesn't slow down message responses.
-   */
-  private async generateAndStoreEmbedding(messageId: string, content: string): Promise<void> {
+  private async generateAndStoreEmbedding(
+    messageId: string,
+    content: string,
+  ): Promise<void> {
     if (!this.embeddingsService) return;
-
     const embedding = await this.embeddingsService.embed(content);
-
-    const { error } = await this.client
-      .from("messages")
-      .update({ embedding })
-      .eq("id", messageId);
-
-    if (error) {
-      console.warn("Failed to store embedding:", error);
-    }
+    await dbUpdateMessageEmbedding(this.db, messageId, embedding);
   }
 
   /**
-   * Create a new goal
-   *
-   * @param description - Goal description
-   * @param deadline - Optional deadline
+   * Create a new goal. An optional deadline is stored in goal metadata.
    */
   async createGoal(description: string, deadline?: Date): Promise<void> {
-    const { error } = await this.client.from("goals").insert({
-      user_id: this.userId,
-      description,
-      deadline: deadline?.toISOString() || null,
-      status: "active",
-    });
-
-    if (error) {
-      console.error("Error creating goal:", error);
-      throw error;
+    const goal = await dbCreateGoal(this.db, this.userId, description);
+    if (goal && deadline) {
+      await dbUpdateGoalMetadata(this.db, goal.id, {
+        deadline: deadline.toISOString(),
+      });
     }
   }
 
   /**
-   * Update a goal status
-   *
-   * @param goalId - Goal ID
-   * @param status - New status
+   * Update a goal's status. "cancelled" maps to the schema's "archived".
    */
   async updateGoalStatus(
     goalId: string,
-    status: "active" | "completed" | "cancelled"
+    status: "active" | "completed" | "cancelled",
   ): Promise<void> {
-    const { error } = await this.client
-      .from("goals")
-      .update({ status })
-      .eq("id", goalId)
-      .eq("user_id", this.userId);
-
-    if (error) {
-      console.error("Error updating goal:", error);
-      throw error;
-    }
+    const mapped = status === "cancelled" ? "archived" : status;
+    await dbUpdateGoalStatus(this.db, goalId, mapped);
   }
 
   /**
-   * Store or update a user fact
-   *
-   * @param key - Fact key
-   * @param value - Fact value
-   * @param confidence - Confidence score (0-1)
+   * Store or update a user fact. Voice confidence is 0-1; the schema stores
+   * 1-10, so it is scaled and clamped.
    */
-  async upsertFact(key: string, value: string, confidence: number = 0.8): Promise<void> {
-    // First check if fact exists
-    const { data: existing } = await this.client
-      .from("facts")
-      .select("id")
-      .eq("user_id", this.userId)
-      .eq("key", key)
-      .single();
-
-    if (existing) {
-      // Update existing
-      const { error } = await this.client
-        .from("facts")
-        .update({ value, confidence, updated_at: new Date().toISOString() })
-        .eq("id", existing.id);
-
-      if (error) {
-        console.error("Error updating fact:", error);
-        throw error;
-      }
-    } else {
-      // Insert new
-      const { error } = await this.client.from("facts").insert({
-        user_id: this.userId,
-        key,
-        value,
-        confidence,
-      });
-
-      if (error) {
-        console.error("Error inserting fact:", error);
-        throw error;
-      }
-    }
+  async upsertFact(
+    key: string,
+    value: string,
+    confidence: number = 0.8,
+  ): Promise<void> {
+    const scaled = Math.max(1, Math.min(10, Math.round(confidence * 10)));
+    await dbUpsertUserFact(
+      this.db,
+      this.userId,
+      key as FactType,
+      value,
+      scaled,
+    );
   }
 
   /**
-   * Semantic search for relevant messages
-   *
-   * @param query - Search query
-   * @param limit - Maximum results
-   * @returns Array of relevant messages
+   * Semantic search over messages. Falls back to a substring match when no
+   * embeddings provider is configured or the query embedding fails.
    */
-  async semanticSearch(query: string, limit: number = 5): Promise<StoredMessage[]> {
-    // If embeddings service is available, use pgvector similarity search
+  async semanticSearch(
+    query: string,
+    limit: number = 5,
+  ): Promise<StoredMessage[]> {
     if (this.embeddingsService) {
       try {
         const queryEmbedding = await this.embeddingsService.embed(query);
-
-        const { data, error } = await this.client.rpc("search_similar_messages", {
-          query_embedding: JSON.stringify(queryEmbedding),
-          target_user_id: this.userId,
-          limit_count: limit,
-          similarity_threshold: 0.7,
-        });
-
-        if (error) {
-          console.error("Semantic search RPC failed, falling back to text search:", error);
-        } else if (data && data.length > 0) {
-          // Map RPC results to StoredMessage format
-          return (data as Array<{
-            id: string;
-            telegram_user_id: number;
-            role: string;
-            content: string;
-            similarity: number;
-            created_at?: string;
-            metadata?: Record<string, unknown>;
-          }>).map((row) => ({
-            id: row.id,
-            user_id: row.telegram_user_id,
-            content: row.content,
-            role: row.role as "user" | "assistant",
-            created_at: row.created_at || new Date().toISOString(),
-            metadata: row.metadata,
+        const hits = await dbSearchSimilarMessages(
+          this.db,
+          queryEmbedding,
+          this.userId,
+          limit,
+          0.7,
+        );
+        if (hits.length > 0) {
+          return hits.map((h) => ({
+            id: h.id,
+            user_id: h.telegram_user_id,
+            content: h.content,
+            role: h.role as "user" | "assistant",
+            created_at: new Date().toISOString(),
           }));
         }
       } catch (err) {
-        console.error("Embedding generation failed, falling back to text search:", err);
+        console.error("Embedding search failed, falling back to text:", err);
       }
     }
 
-    // Fallback: basic text search when embeddings are unavailable
-    const { data, error } = await this.client
-      .from("messages")
-      .select("*")
-      .eq("user_id", this.userId)
-      .textSearch("content", query)
-      .limit(limit);
+    // Fallback: substring search over recent messages
+    const rows = this.db
+      .query(
+        `SELECT id, telegram_user_id, content, role, created_at, metadata
+         FROM messages
+         WHERE telegram_user_id = ? AND content LIKE ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .all(this.userId, `%${query}%`, limit) as Array<{
+      id: string;
+      telegram_user_id: number;
+      content: string;
+      role: string;
+      created_at: string;
+      metadata: string;
+    }>;
 
-    if (error) {
-      console.error("Error searching messages:", error);
-      return [];
-    }
-
-    return data || [];
+    return rows.map((r) => ({
+      id: r.id,
+      user_id: r.telegram_user_id,
+      content: r.content,
+      role: r.role as "user" | "assistant",
+      created_at: r.created_at,
+    }));
   }
 
-  /**
-   * Get the Supabase client (for advanced usage)
-   */
-  getClient(): SupabaseClient {
-    return this.client;
+  /** Returns the underlying database handle (advanced usage). */
+  getClient(): BotDatabase {
+    return this.db;
   }
 
-  /**
-   * Get the user ID
-   */
+  /** Returns the user id this service is scoped to. */
   getUserId(): number {
     return this.userId;
   }
@@ -440,31 +310,21 @@ export class MemoryService {
 // ============================================================================
 
 /**
- * Create a MemoryService instance from environment variables
+ * Create a MemoryService instance for a user.
  */
 export function createMemoryService(userId: number): MemoryService {
-  const url = process.env.SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url) {
-    throw new Error("SUPABASE_URL is required");
-  }
-  if (!serviceKey) {
-    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required");
-  }
-
-  return new MemoryService({ url, serviceKey }, userId);
+  return new MemoryService(userId);
 }
 
 /**
- * Create multiple MemoryService instances for multiple users
+ * Create MemoryService instances for multiple users.
  */
-export function createMemoryServices(userIds: number[]): Map<number, MemoryService> {
+export function createMemoryServices(
+  userIds: number[],
+): Map<number, MemoryService> {
   const services = new Map<number, MemoryService>();
-
   for (const userId of userIds) {
-    services.set(userId, createMemoryService(userId));
+    services.set(userId, new MemoryService(userId));
   }
-
   return services;
 }

@@ -5,11 +5,8 @@
  * This is the main interface for working with semantic memory.
  */
 
-import type { SupabaseClient } from "./supabase.js";
+import { getDb, type BotDatabase } from "./sqlite.js";
 import {
-  createSupabaseClient,
-  getSupabaseClient,
-  getSupabaseAdminClient,
   type MessageRow,
   type GoalRow,
   type UserFactRow,
@@ -98,34 +95,12 @@ export interface QueryContext {
  * Main database client for semantic memory operations
  */
 export class DatabaseClient {
-  private supabase: SupabaseClient;
-  private adminSupabase: SupabaseClient;
+  private db: BotDatabase;
   private embeddingConfig: EmbeddingConfig;
 
   constructor(config: MemoryConfig = {}) {
-    // Initialize Supabase clients
-    if (config.supabaseUrl && config.supabaseAnonKey) {
-      this.supabase = createSupabaseClient({
-        url: config.supabaseUrl,
-        anonKey: config.supabaseAnonKey,
-        serviceRoleKey: config.supabaseServiceKey,
-      });
-    } else {
-      this.supabase = getSupabaseClient();
-    }
-
-    if (config.supabaseUrl && config.supabaseServiceKey) {
-      this.adminSupabase = createSupabaseClient(
-        {
-          url: config.supabaseUrl,
-          anonKey: config.supabaseServiceKey,
-          serviceRoleKey: config.supabaseServiceKey,
-        },
-        true,
-      );
-    } else {
-      this.adminSupabase = getSupabaseAdminClient();
-    }
+    // Local SQLite database handle (single, process-wide)
+    this.db = getDb();
 
     // Configure embeddings
     this.embeddingConfig = {
@@ -144,7 +119,7 @@ export class DatabaseClient {
   ): Promise<MessageRow | null> {
     const embedding = await generateEmbedding(content, this.embeddingConfig);
     return storeMessage(
-      this.supabase,
+      this.db,
       userId,
       "user",
       content,
@@ -163,7 +138,7 @@ export class DatabaseClient {
   ): Promise<MessageRow | null> {
     const embedding = await generateEmbedding(content, this.embeddingConfig);
     return storeMessage(
-      this.supabase,
+      this.db,
       userId,
       "assistant",
       content,
@@ -178,7 +153,7 @@ export class DatabaseClient {
     userId: number,
     limit = 50,
   ): Promise<MessageRow[]> {
-    const result = await getRecentMessages(this.supabase, userId, limit);
+    const result = await getRecentMessages(this.db, userId, limit);
     return result.messages;
   }
 
@@ -186,7 +161,7 @@ export class DatabaseClient {
    * Gets formatted conversation context for LLM prompting
    */
   async getFormattedContext(userId: number, maxMessages = 20): Promise<string> {
-    return getConversationContext(this.supabase, userId, maxMessages);
+    return getConversationContext(this.db, userId, maxMessages);
   }
 
   /**
@@ -215,7 +190,7 @@ export class DatabaseClient {
 
     // Get recent conversation
     const conversation = await getConversationContext(
-      this.supabase,
+      this.db,
       userId,
       maxMessages,
     );
@@ -230,27 +205,27 @@ export class DatabaseClient {
     const [relevantMessages, relevantGoals, relevantFacts, userFactsData] =
       await Promise.all([
         searchSimilarMessages(
-          this.supabase,
+          this.db,
           queryEmbedding,
           userId,
           maxSimilarMessages,
           similarityThreshold,
         ),
         searchRelevantGoals(
-          this.supabase,
+          this.db,
           queryEmbedding,
           userId,
           maxGoals,
           similarityThreshold - 0.1,
         ),
         searchRelevantFacts(
-          this.supabase,
+          this.db,
           queryEmbedding,
           userId,
           maxFacts,
           similarityThreshold - 0.05,
         ),
-        getUserFacts(this.supabase, userId, undefined, 5),
+        getUserFacts(this.db, userId, undefined, 5),
       ]);
 
     // Format user facts
@@ -293,7 +268,7 @@ export class DatabaseClient {
     const embedding = await generateEmbedding(text, this.embeddingConfig);
 
     return createGoal(
-      this.supabase,
+      this.db,
       userId,
       title,
       description,
@@ -307,28 +282,28 @@ export class DatabaseClient {
    * Gets all active goals for a user
    */
   async getActiveGoals(userId: number): Promise<GoalRow[]> {
-    return getActiveGoals(this.supabase, userId);
+    return getActiveGoals(this.db, userId);
   }
 
   /**
    * Marks a goal as completed
    */
   async completeGoal(goalId: string): Promise<boolean> {
-    return completeGoal(this.supabase, goalId);
+    return completeGoal(this.db, goalId);
   }
 
   /**
    * Archives a goal
    */
   async archiveGoal(goalId: string): Promise<boolean> {
-    return archiveGoal(this.supabase, goalId);
+    return archiveGoal(this.db, goalId);
   }
 
   /**
    * Deletes a goal
    */
   async deleteGoal(goalId: string): Promise<boolean> {
-    return deleteGoal(this.supabase, goalId);
+    return deleteGoal(this.db, goalId);
   }
 
   /**
@@ -343,7 +318,7 @@ export class DatabaseClient {
   ): Promise<UserFactRow | null> {
     const embedding = await generateEmbedding(factText, this.embeddingConfig);
     return upsertUserFact(
-      this.supabase,
+      this.db,
       userId,
       factType,
       factText,
@@ -361,28 +336,28 @@ export class DatabaseClient {
     factType?: FactType,
     minConfidence = 1,
   ): Promise<UserFactRow[]> {
-    return getUserFacts(this.supabase, userId, factType, minConfidence);
+    return getUserFacts(this.db, userId, factType, minConfidence);
   }
 
   /**
    * Gets formatted facts summary for LLM prompting
    */
   async getFactsSummary(userId: number, minConfidence = 5): Promise<string> {
-    return getFactsSummary(this.supabase, userId, minConfidence);
+    return getFactsSummary(this.db, userId, minConfidence);
   }
 
   /**
    * Deletes a fact
    */
   async deleteFact(factId: string): Promise<boolean> {
-    return deleteFact(this.supabase, factId);
+    return deleteFact(this.db, factId);
   }
 
   /**
    * Gets message statistics for a user
    */
   async getStats(userId: number) {
-    return getMessageStats(this.supabase, userId);
+    return getMessageStats(this.db, userId);
   }
 
   /**
@@ -411,9 +386,9 @@ export class DatabaseClient {
     );
 
     const [messages, goals, facts] = await Promise.all([
-      searchSimilarMessages(this.supabase, queryEmbedding, userId, maxMessages, threshold),
-      searchRelevantGoals(this.supabase, queryEmbedding, userId, maxGoals, threshold - 0.1),
-      searchRelevantFacts(this.supabase, queryEmbedding, userId, maxFacts, threshold - 0.05),
+      searchSimilarMessages(this.db, queryEmbedding, userId, maxMessages, threshold),
+      searchRelevantGoals(this.db, queryEmbedding, userId, maxGoals, threshold - 0.1),
+      searchRelevantFacts(this.db, queryEmbedding, userId, maxFacts, threshold - 0.05),
     ]);
 
     return {
@@ -464,7 +439,7 @@ export class DatabaseClient {
     }));
 
     // Store in database
-    return storeMessages(this.supabase, messagesWithEmbeddings);
+    return storeMessages(this.db, messagesWithEmbeddings);
   }
 }
 

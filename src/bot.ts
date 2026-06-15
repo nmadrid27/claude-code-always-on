@@ -38,6 +38,10 @@ import {
   createVaultIdea,
   searchVault,
 } from "./services/vault-bridge.js";
+import {
+  searchVaultFilesystem,
+  formatVaultFsHits,
+} from "./services/vault-fs.js";
 
 const log = createLogger("bot");
 
@@ -319,17 +323,31 @@ bot.command("vault", async (ctx) => {
           return;
         }
         const thinkingMsg = await ctx.reply("Searching vault...");
-        const results = await searchVault(args);
-        await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
-        if (results.length === 0) {
-          await ctx.reply("No results found.");
-        } else {
-          const formatted = results.map((f, i) => `${i + 1}. \`${f}\``).join("\n");
-          try {
-            await ctx.reply(`*Search results for "${args}":*\n\n${formatted}`, { parse_mode: "Markdown" });
-          } catch {
-            await ctx.reply(`Search results for "${args}":\n\n${formatted}`);
+
+        // Primary: Obsidian Local REST API (richer index when the app is open).
+        // Fallback: read-only filesystem grep of the synced vault on disk, which
+        // works even when Obsidian is closed and never touches the REST/MCP.
+        try {
+          const results = await searchVault(args);
+          await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
+          if (results.length === 0) {
+            await ctx.reply("No results found.");
+          } else {
+            const formatted = results.map((f, i) => `${i + 1}. \`${f}\``).join("\n");
+            try {
+              await ctx.reply(`*Search results for "${args}":*\n\n${formatted}`, { parse_mode: "Markdown" });
+            } catch {
+              await ctx.reply(`Search results for "${args}":\n\n${formatted}`);
+            }
           }
+        } catch (restErr) {
+          log.warn("Vault REST search unavailable; using filesystem fallback", {
+            error: String(restErr),
+          });
+          const fsHits = await searchVaultFilesystem(args);
+          await ctx.api.deleteMessage(ctx.chat!.id, thinkingMsg.message_id);
+          // Plain text (no Markdown) so snippet characters cannot break parsing.
+          await ctx.reply(formatVaultFsHits(fsHits, args));
         }
         break;
       }

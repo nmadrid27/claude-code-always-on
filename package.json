@@ -33,7 +33,6 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.95.3",
     "dotenv": "^17.2.4",
     "grammy": "^1.40.0"
   }
