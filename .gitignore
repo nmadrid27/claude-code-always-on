@@ -44,3 +44,9 @@ src/mcp/mcp-config.json
 
 # Log files
 *.log
+
+# SQLite database files (e.g. a BOT_DB_PATH pointed inside the repo)
+*.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
