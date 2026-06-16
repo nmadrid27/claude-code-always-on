@@ -21,6 +21,92 @@ export interface ToolCall {
 }
 
 /**
+ * Extracts the final assistant text (and token usage) from Claude Code's
+ * parsed `--output-format json` output.
+ *
+ * Claude Code returns an array of stream events ending in a
+ * `{ type: "result", result: "<text>", usage: {...} }` element. Older versions
+ * returned a single object with a `.result` (or similar) field, or a plain
+ * string. This handles all of those shapes.
+ */
+export function extractClaudeResult(parsed: unknown): {
+  outputText: string;
+  tokensUsed?: number;
+} {
+  const usageToTokens = (usage: unknown): number | undefined => {
+    if (!usage || typeof usage !== "object") return undefined;
+    const u = usage as Record<string, unknown>;
+    if (typeof u.total_tokens === "number") return u.total_tokens;
+    const input = typeof u.input_tokens === "number" ? u.input_tokens : 0;
+    const output = typeof u.output_tokens === "number" ? u.output_tokens : 0;
+    return input + output > 0 ? input + output : undefined;
+  };
+
+  const fromObject = (
+    obj: Record<string, unknown>,
+  ): { outputText: string; tokensUsed?: number } => {
+    const outputText = (obj.result ??
+      obj.output ??
+      obj.response ??
+      obj.text ??
+      obj.message ??
+      obj.content ??
+      "") as string;
+    return {
+      outputText: typeof outputText === "string" ? outputText : "",
+      tokensUsed: usageToTokens(obj.usage),
+    };
+  };
+
+  if (typeof parsed === "string") {
+    return { outputText: parsed };
+  }
+
+  if (Array.isArray(parsed)) {
+    // Prefer the terminal "result" event.
+    const resultEvent = [...parsed]
+      .reverse()
+      .find(
+        (e) =>
+          e && typeof e === "object" && (e as { type?: unknown }).type === "result",
+      ) as Record<string, unknown> | undefined;
+    if (resultEvent && typeof resultEvent.result === "string") {
+      return {
+        outputText: resultEvent.result,
+        tokensUsed: usageToTokens(resultEvent.usage),
+      };
+    }
+
+    // Fallback: concatenate assistant message text parts.
+    let text = "";
+    for (const e of parsed) {
+      if (!e || typeof e !== "object") continue;
+      const ev = e as { type?: unknown; message?: unknown };
+      if (ev.type !== "assistant" || !ev.message) continue;
+      const content = (ev.message as { content?: unknown }).content;
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        if (
+          part &&
+          typeof part === "object" &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string"
+        ) {
+          text += (part as { text: string }).text;
+        }
+      }
+    }
+    return { outputText: text };
+  }
+
+  if (parsed && typeof parsed === "object") {
+    return fromObject(parsed as Record<string, unknown>);
+  }
+
+  return { outputText: "" };
+}
+
+/**
  * Request options for invoking Claude Code
  */
 export interface ClaudeCodeRequest {
@@ -58,6 +144,9 @@ export interface ClaudeCodeResponse {
 
   /** Error message if invocation failed */
   error?: string;
+
+  /** True when the failure was specifically a timeout (used to drive retries) */
+  timedOut?: boolean;
 
   /** Tool calls made during execution (if available) */
   toolCalls?: ToolCall[];
@@ -97,6 +186,49 @@ const CLAUDE_COMMAND = "claude";
 
 /** Default model — fast and capable for conversational use */
 const DEFAULT_MODEL = "claude-sonnet-4-6";
+
+/**
+ * Resolves which model to use, in priority order:
+ *   1. An explicit per-request model (e.g. a future /haiku command).
+ *   2. The CLAUDE_MODEL environment variable.
+ *   3. DEFAULT_MODEL (claude-sonnet-4-6).
+ * Blank/whitespace env values are ignored.
+ */
+export function resolveModel(requestModel?: string): string {
+  if (requestModel && requestModel.trim().length > 0) {
+    return requestModel.trim();
+  }
+  const fromEnv = process.env.CLAUDE_MODEL;
+  if (fromEnv && fromEnv.trim().length > 0) {
+    return fromEnv.trim();
+  }
+  return DEFAULT_MODEL;
+}
+
+/**
+ * Resolves the invocation timeout (ms), in priority order:
+ *   1. An explicit per-request timeout.
+ *   2. The CLAUDE_TIMEOUT environment variable.
+ *   3. DEFAULT_TIMEOUT_MS (300000 = 5 minutes).
+ * Blank, non-numeric, or non-positive values are ignored.
+ *
+ * Note: the bot's real successful invocations run a median of ~23s with a tail
+ * to ~107s, so the old hardcoded 120s ceiling clipped legitimate calls. 300s
+ * gives ~3x headroom over the worst observed success.
+ */
+export function resolveTimeout(requestTimeout?: number): number {
+  if (typeof requestTimeout === "number" && Number.isFinite(requestTimeout) && requestTimeout > 0) {
+    return requestTimeout;
+  }
+  const fromEnv = process.env.CLAUDE_TIMEOUT;
+  if (fromEnv && fromEnv.trim().length > 0) {
+    const parsed = Number.parseInt(fromEnv.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_TIMEOUT_MS;
+}
 
 /**
  * ============================================================================
@@ -194,8 +326,8 @@ function buildCommandArgs(request: ClaudeCodeRequest): string[] {
   // JSON output format
   args.push("--output-format", "json");
 
-  // Model selection
-  args.push("--model", request.model ?? DEFAULT_MODEL);
+  // Model selection (request override > CLAUDE_MODEL env > default)
+  args.push("--model", resolveModel(request.model));
 
   // Allowed tools (if specified)
   if (request.allowedTools && request.allowedTools.length > 0) {
@@ -241,8 +373,9 @@ export async function invokeClaudeCode(
   streamCallback?: StreamCallback
 ): Promise<ClaudeCodeResponse> {
   const startTime = Date.now();
-  const timeout = request.timeout ?? DEFAULT_TIMEOUT_MS;
+  const timeout = resolveTimeout(request.timeout);
   const maxOutputLength = request.maxOutputLength ?? DEFAULT_MAX_OUTPUT_LENGTH;
+  let didTimeout = false;
 
   logDebug(`Invoking Claude Code with prompt: "${request.prompt.substring(0, 50)}..."`);
 
@@ -287,6 +420,7 @@ export async function invokeClaudeCode(
     // Set up timeout handler
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => {
+        didTimeout = true;
         logError(`Claude Code invocation timed out after ${timeout}ms`);
         if (proc) {
           proc.kill();
@@ -389,36 +523,12 @@ export async function invokeClaudeCode(
       };
     }
 
-    // Extract response from parsed JSON
-    // Claude Code JSON output structure may vary, handle common formats
-    let outputText = "";
-    let toolCalls: ToolCall[] | undefined;
-    let tokensUsed: number | undefined;
-
-    if (typeof parsedOutput === "string") {
-      outputText = parsedOutput;
-    } else if (parsedOutput && typeof parsedOutput === "object") {
-      const obj = parsedOutput as Record<string, unknown>;
-
-      // Try various possible response fields
-      // Claude Code CLI returns: { type: "result", result: "...", usage: {...} }
-      outputText = (obj.result ?? obj.output ?? obj.response ?? obj.text ?? obj.message ?? obj.content ?? "") as string;
-
-      // Extract tool calls if present
-      if (Array.isArray(obj.toolCalls)) {
-        toolCalls = obj.toolCalls as ToolCall[];
-      }
-
-      // Extract token usage if present
-      if (typeof obj.tokensUsed === "number") {
-        tokensUsed = obj.tokensUsed;
-      } else if (typeof obj.usage === "object" && obj.usage) {
-        const usage = obj.usage as Record<string, unknown>;
-        if (typeof usage.total_tokens === "number") {
-          tokensUsed = usage.total_tokens;
-        }
-      }
-    }
+    // Extract response from parsed JSON. Handles the modern array
+    // (stream-json events) shape as well as legacy object/string shapes.
+    const extracted = extractClaudeResult(parsedOutput);
+    let outputText = extracted.outputText;
+    const toolCalls: ToolCall[] | undefined = undefined;
+    const tokensUsed: number | undefined = extracted.tokensUsed;
 
     // Handle empty output
     if (!outputText && result.output) {
@@ -466,6 +576,7 @@ export async function invokeClaudeCode(
     return {
       success: false,
       error: errorMessage,
+      timedOut: didTimeout,
       metadata: {
         duration,
         truncated: false,
@@ -473,6 +584,57 @@ export async function invokeClaudeCode(
       }
     };
   }
+}
+
+/**
+ * ============================================================================
+ * RETRY WRAPPER
+ * ============================================================================
+ */
+
+/** Options controlling automatic retry behavior on timeout */
+export interface RetryOptions {
+  /** How many extra attempts to make after a timeout (default: 1) */
+  maxTimeoutRetries?: number;
+  /** Invoked before each retry attempt (1-indexed); e.g. to notify the user */
+  onTimeoutRetry?: (attempt: number) => void | Promise<void>;
+}
+
+/**
+ * Invokes Claude Code, retrying ONLY when the failure was a timeout.
+ *
+ * Rationale (evidence-based): a request that times out at the ceiling routinely
+ * succeeds on a warm retry (observed: a request that hit the 120s wall completed
+ * in 44s when re-run seconds later). Non-timeout failures are returned as-is so
+ * we never paper over real errors.
+ *
+ * The `invoker` parameter is injectable purely for testing; production callers
+ * should omit it so the real `invokeClaudeCode` is used.
+ */
+export async function invokeClaudeCodeWithRetry(
+  request: ClaudeCodeRequest,
+  opts: RetryOptions = {},
+  invoker: (
+    req: ClaudeCodeRequest,
+    cb?: StreamCallback
+  ) => Promise<ClaudeCodeResponse> = invokeClaudeCode,
+  streamCallback?: StreamCallback
+): Promise<ClaudeCodeResponse> {
+  const maxRetries = opts.maxTimeoutRetries ?? 1;
+
+  let response = await invoker(request, streamCallback);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Stop as soon as we succeed or hit a non-timeout failure.
+    if (response.success || !response.timedOut) {
+      return response;
+    }
+    if (opts.onTimeoutRetry) {
+      await opts.onTimeoutRetry(attempt);
+    }
+    logError(`Claude Code timed out; retry attempt ${attempt}/${maxRetries}`);
+    response = await invoker(request, streamCallback);
+  }
+  return response;
 }
 
 /**

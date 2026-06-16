@@ -1,139 +1,33 @@
 /**
- * Supabase Client Configuration
+ * Database handle + row types
  *
- * This module provides a configured Supabase client for database operations.
- * It reads connection details from environment variables:
- * - SUPABASE_URL: Your Supabase project URL
- * - SUPABASE_ANON_KEY: Anonymous key for client-side operations
- * - SUPABASE_SERVICE_ROLE_KEY: Service role key for admin operations (use carefully!)
- */
-
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-
-export type { SupabaseClient };
-
-/**
- * Environment variables required for Supabase connection
- */
-interface SupabaseConfig {
-  url: string;
-  anonKey: string;
-  serviceRoleKey?: string;
-}
-
-/**
- * Validates that required environment variables are set
- */
-function getSupabaseConfig(): SupabaseConfig {
-  const url = process.env.SUPABASE_URL;
-  const anonKey = process.env.SUPABASE_ANON_KEY;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!url) {
-    throw new Error("SUPABASE_URL environment variable is not set");
-  }
-
-  if (!anonKey) {
-    throw new Error("SUPABASE_ANON_KEY environment variable is not set");
-  }
-
-  return { url, anonKey, serviceRoleKey };
-}
-
-/**
- * Creates a Supabase client with the appropriate configuration
+ * Historically this module wrapped a Supabase/Postgres client. The backend is
+ * now local SQLite (see ./sqlite.ts). The filename and the `getSupabaseClient`
+ * export names are retained for backward compatibility with the many call sites
+ * that import them; they now return the SQLite database handle.
  *
- * @param config - Supabase connection configuration
- * @param useServiceRole - If true, uses service role key (bypasses RLS)
- * @returns Configured Supabase client
+ * `SupabaseClient` is kept as a type alias for `BotDatabase` so existing
+ * signatures continue to type-check.
  */
-export function createSupabaseClient(
-  config?: SupabaseConfig,
-  useServiceRole = false,
-): SupabaseClient {
-  const resolvedConfig = config ?? getSupabaseConfig();
 
-  if (useServiceRole && !resolvedConfig.serviceRoleKey) {
-    throw new Error(
-      "SUPABASE_SERVICE_ROLE_KEY is required for admin operations but is not set"
-    );
-  }
+import { getDb, type BotDatabase } from "./sqlite.js";
 
-  const key = useServiceRole ? resolvedConfig.serviceRoleKey! : resolvedConfig.anonKey;
+/** Backward-compatible alias for the database handle type. */
+export type SupabaseClient = BotDatabase;
 
-  return createClient(resolvedConfig.url, key, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    },
-    db: {
-      schema: "public",
-    },
-  });
+/**
+ * Returns the bot's database handle. (Formerly the anon Supabase client.)
+ */
+export function getSupabaseClient(): BotDatabase {
+  return getDb();
 }
 
 /**
- * Singleton instance for anonymous operations (respects RLS)
+ * Returns the bot's database handle. (Formerly the service-role Supabase
+ * client; SQLite has no row-level security, so this is the same handle.)
  */
-let anonClient: SupabaseClient | null = null;
-
-/**
- * Gets the anonymous Supabase client (respects Row Level Security)
- * This client operates with the user's context set via setUserId()
- */
-export function getSupabaseClient(): SupabaseClient {
-  if (!anonClient) {
-    anonClient = createSupabaseClient();
-  }
-  return anonClient;
-}
-
-/**
- * Singleton instance for admin operations (bypasses RLS)
- * Use with caution! This client has full access to all data.
- */
-let adminClient: SupabaseClient | null = null;
-
-/**
- * Gets the admin Supabase client (bypasses Row Level Security)
- * Only use this for operations that need to access data across users.
- */
-export function getSupabaseAdminClient(): SupabaseClient {
-  if (!adminClient) {
-    adminClient = createSupabaseClient(undefined, true);
-  }
-  return adminClient;
-}
-
-/**
- * Sets the current user context for Row Level Security
- * This must be called before database operations when acting on behalf of a user
- *
- * @param userId - Telegram user ID to set as the current user
- * @returns A function to restore the previous user context
- */
-export async function setUserId(
-  client: SupabaseClient,
-  userId: number,
-): Promise<() => Promise<void>> {
-  // Store previous context
-  let previousId: unknown = null;
-  try {
-    const { data } = await client.rpc("get_current_user_id");
-    previousId = data;
-  } catch {
-    previousId = null;
-  }
-
-  // Set new context
-  await client.rpc("set_current_user_id", { user_id: userId });
-
-  // Return restore function
-  return async () => {
-    if (previousId !== null) {
-      await client.rpc("set_current_user_id", { user_id: previousId });
-    }
-  };
+export function getSupabaseAdminClient(): BotDatabase {
+  return getDb();
 }
 
 /**

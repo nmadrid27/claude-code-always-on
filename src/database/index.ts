@@ -15,12 +15,10 @@ export {
   type QueryContext,
 } from "./client.js";
 
-// Supabase utilities
+// Database handle + row types
 export {
-  createSupabaseClient,
   getSupabaseClient,
   getSupabaseAdminClient,
-  setUserId,
   type SupabaseClient,
   type MessageRow,
   type GoalRow,
@@ -30,6 +28,15 @@ export {
   type RelevantGoal,
   type RelevantFact,
 } from "./supabase.js";
+
+// SQLite connection
+export {
+  getDb,
+  openDatabase,
+  closeDb,
+  resolveDbPath,
+  type BotDatabase,
+} from "./sqlite.js";
 
 // Message operations
 export {
